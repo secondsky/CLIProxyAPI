@@ -4,11 +4,7 @@
 package qwen
 
 import (
-	"encoding/json"
-	"fmt"
-	"os"
-	"path/filepath"
-
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/accounts"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 )
 
@@ -43,21 +39,20 @@ type QwenTokenStorage struct {
 //   - error: An error if the operation fails, nil otherwise
 func (ts *QwenTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "qwen"
-	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
-	}
-
-	f, err := os.Create(authFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to create token file: %w", err)
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-
-	if err = json.NewEncoder(f).Encode(ts); err != nil {
-		return fmt.Errorf("failed to write token to file: %w", err)
-	}
-	return nil
+	accountID := "qwen"
+	return accounts.SaveProviderAccount("qwen", accountID, func(existing map[string]any) map[string]any {
+		for k, v := range map[string]any{
+			"access_token":  ts.AccessToken,
+			"refresh_token": ts.RefreshToken,
+			"last_refresh":  ts.LastRefresh,
+			"resource_url":  ts.ResourceURL,
+			"expired":       ts.Expire,
+		} {
+			if s, ok := v.(string); ok && s == "" {
+				continue
+			}
+			existing[k] = v
+		}
+		return existing
+	})
 }

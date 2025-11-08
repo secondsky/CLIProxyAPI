@@ -4,13 +4,10 @@
 package gemini
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/accounts"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
-	log "github.com/sirupsen/logrus"
 )
 
 // GeminiTokenStorage stores OAuth2 token information for Google Gemini API authentication.
@@ -46,24 +43,22 @@ type GeminiTokenStorage struct {
 // Returns:
 //   - error: An error if the operation fails, nil otherwise
 func (ts *GeminiTokenStorage) SaveTokenToFile(authFilePath string) error {
+	if ts.Email == "" {
+		return fmt.Errorf("email is required for Gemini account identification")
+	}
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "gemini"
-	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
-	}
-
-	f, err := os.Create(authFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to create token file: %w", err)
-	}
-	defer func() {
-		if errClose := f.Close(); errClose != nil {
-			log.Errorf("failed to close file: %v", errClose)
+	accountID := ts.Email
+	return accounts.SaveProviderAccount("gemini", accountID, func(existing map[string]any) map[string]any {
+		for k, v := range map[string]any{
+			"token":      ts.Token,
+			"project_id": ts.ProjectID,
+			"email":      ts.Email,
+		} {
+			if v == nil {
+				continue
+			}
+			existing[k] = v
 		}
-	}()
-
-	if err = json.NewEncoder(f).Encode(ts); err != nil {
-		return fmt.Errorf("failed to write token to file: %w", err)
-	}
-	return nil
+		return existing
+	})
 }
