@@ -5,6 +5,7 @@ package gemini
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/accounts"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -43,22 +44,58 @@ type GeminiTokenStorage struct {
 // Returns:
 //   - error: An error if the operation fails, nil otherwise
 func (ts *GeminiTokenStorage) SaveTokenToFile(authFilePath string) error {
+	misc.LogSavingCredentials(authFilePath)
+	ts.Type = "gemini"
+
 	if ts.Email == "" {
 		return fmt.Errorf("email is required for Gemini account identification")
 	}
-	misc.LogSavingCredentials(authFilePath)
-	accountID := ts.Email
+
+	// Distinguish accounts by project when provided (supports multi-project installs).
+	accountID := strings.TrimSpace(ts.Email)
+	if proj := strings.TrimSpace(ts.ProjectID); proj != "" {
+		norm := proj
+		if strings.EqualFold(norm, "all") || strings.Contains(norm, ",") {
+			norm = "all"
+		}
+		accountID = fmt.Sprintf("%s-%s", accountID, norm)
+	}
+
 	return accounts.SaveProviderAccount("gemini", accountID, func(existing map[string]any) map[string]any {
 		for k, v := range map[string]any{
 			"token":      ts.Token,
 			"project_id": ts.ProjectID,
 			"email":      ts.Email,
+			"auto":       ts.Auto,
+			"checked":    ts.Checked,
 		} {
-			if v == nil {
+			switch val := v.(type) {
+			case string:
+				if val == "" {
+					continue
+				}
+			case nil:
 				continue
 			}
 			existing[k] = v
 		}
 		return existing
 	})
+}
+
+// CredentialFileName returns the filename used to persist Gemini CLI credentials.
+// When projectID represents multiple projects (comma-separated or literal ALL),
+// the suffix is normalized to "all" and a "gemini-" prefix is enforced to keep
+// web and CLI generated files consistent.
+func CredentialFileName(email, projectID string, includeProviderPrefix bool) string {
+	email = strings.TrimSpace(email)
+	project := strings.TrimSpace(projectID)
+	if strings.EqualFold(project, "all") || strings.Contains(project, ",") {
+		return fmt.Sprintf("gemini-%s-all.json", email)
+	}
+	prefix := ""
+	if includeProviderPrefix {
+		prefix = "gemini-"
+	}
+	return fmt.Sprintf("%s%s-%s.json", prefix, email, project)
 }
