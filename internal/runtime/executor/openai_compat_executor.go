@@ -8,8 +8,10 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -52,8 +54,16 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	translated := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), opts.Stream)
-	if modelOverride := e.resolveUpstreamModel(req.Model, auth); modelOverride != "" {
+	modelOverride := e.resolveUpstreamModel(req.Model, auth)
+	if modelOverride != "" {
 		translated = e.overrideModel(translated, modelOverride)
+	}
+	translated = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", translated)
+	allowCompat := e.allowCompatReasoningEffort(req.Model, auth)
+	translated = ApplyReasoningEffortMetadata(translated, req.Metadata, req.Model, "reasoning_effort", allowCompat)
+	translated = NormalizeThinkingConfig(translated, req.Model, allowCompat)
+	if errValidate := ValidateThinkingConfig(translated, req.Model); errValidate != nil {
+		return resp, errValidate
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
@@ -66,6 +76,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -110,6 +125,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	appendAPIResponseChunk(ctx, e.cfg, body)
 	reporter.publish(ctx, parseOpenAIUsage(body))
+	// Ensure we at least record the request even if upstream doesn't return usage
+	reporter.ensurePublished(ctx)
 	// Translate response back to source format when needed
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, body, &param)
@@ -129,8 +146,16 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	translated := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
-	if modelOverride := e.resolveUpstreamModel(req.Model, auth); modelOverride != "" {
+	modelOverride := e.resolveUpstreamModel(req.Model, auth)
+	if modelOverride != "" {
 		translated = e.overrideModel(translated, modelOverride)
+	}
+	translated = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", translated)
+	allowCompat := e.allowCompatReasoningEffort(req.Model, auth)
+	translated = ApplyReasoningEffortMetadata(translated, req.Metadata, req.Model, "reasoning_effort", allowCompat)
+	translated = NormalizeThinkingConfig(translated, req.Model, allowCompat)
+	if errValidate := ValidateThinkingConfig(translated, req.Model); errValidate != nil {
+		return nil, errValidate
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
@@ -143,6 +168,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("Cache-Control", "no-cache")
 	var authID, authLabel, authType, authValue string
@@ -190,8 +220,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
-		buf := make([]byte, 20_971_520)
-		scanner.Buffer(buf, 20_971_520)
+		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -214,6 +243,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			reporter.publishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		}
+		// Ensure we record the request if no usage chunk was ever seen
+		reporter.ensurePublished(ctx)
 	}()
 	return stream, nil
 }
@@ -288,6 +319,27 @@ func (e *OpenAICompatExecutor) resolveUpstreamModel(alias string, auth *cliproxy
 	return ""
 }
 
+func (e *OpenAICompatExecutor) allowCompatReasoningEffort(model string, auth *cliproxyauth.Auth) bool {
+	trimmed := strings.TrimSpace(model)
+	if trimmed == "" || e == nil || e.cfg == nil {
+		return false
+	}
+	compat := e.resolveCompatConfig(auth)
+	if compat == nil || len(compat.Models) == 0 {
+		return false
+	}
+	for i := range compat.Models {
+		entry := compat.Models[i]
+		if strings.EqualFold(strings.TrimSpace(entry.Alias), trimmed) {
+			return true
+		}
+		if strings.EqualFold(strings.TrimSpace(entry.Name), trimmed) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *config.OpenAICompatibility {
 	if auth == nil || e.cfg == nil {
 		return nil
@@ -324,8 +376,9 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 }
 
 type statusErr struct {
-	code int
-	msg  string
+	code       int
+	msg        string
+	retryAfter *time.Duration
 }
 
 func (e statusErr) Error() string {
@@ -334,4 +387,5 @@ func (e statusErr) Error() string {
 	}
 	return fmt.Sprintf("status %d", e.code)
 }
-func (e statusErr) StatusCode() int { return e.code }
+func (e statusErr) StatusCode() int            { return e.code }
+func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }

@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -14,8 +16,12 @@ import (
 type Auth struct {
 	// ID uniquely identifies the auth record across restarts.
 	ID string `json:"id"`
+	// Index is a stable runtime identifier derived from auth metadata (not persisted).
+	Index string `json:"-"`
 	// Provider is the upstream provider key (e.g. "gemini", "claude").
 	Provider string `json:"provider"`
+	// Prefix optionally namespaces models for routing (e.g., "teamA/gemini-3-pro-preview").
+	Prefix string `json:"prefix,omitempty"`
 	// FileName stores the relative or absolute path of the backing auth file.
 	FileName string `json:"-"`
 	// Storage holds the token persistence implementation used during login flows.
@@ -55,6 +61,8 @@ type Auth struct {
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
+
+	indexAssigned bool `json:"-"`
 }
 
 // QuotaState contains limiter tracking data for a credential.
@@ -115,6 +123,46 @@ func (a *Auth) Clone() *Auth {
 	return &copyAuth
 }
 
+func stableAuthIndex(seed string) string {
+	seed = strings.TrimSpace(seed)
+	if seed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:8])
+}
+
+// EnsureIndex returns a stable index derived from the auth file name or API key.
+func (a *Auth) EnsureIndex() string {
+	if a == nil {
+		return ""
+	}
+	if a.indexAssigned && a.Index != "" {
+		return a.Index
+	}
+
+	seed := strings.TrimSpace(a.FileName)
+	if seed != "" {
+		seed = "file:" + seed
+	} else if a.Attributes != nil {
+		if apiKey := strings.TrimSpace(a.Attributes["api_key"]); apiKey != "" {
+			seed = "api_key:" + apiKey
+		}
+	}
+	if seed == "" {
+		if id := strings.TrimSpace(a.ID); id != "" {
+			seed = "id:" + id
+		} else {
+			return ""
+		}
+	}
+
+	idx := stableAuthIndex(seed)
+	a.Index = idx
+	a.indexAssigned = true
+	return idx
+}
+
 // Clone duplicates a model state including nested error details.
 func (m *ModelState) Clone() *ModelState {
 	if m == nil {
@@ -130,6 +178,20 @@ func (m *ModelState) Clone() *ModelState {
 		}
 	}
 	return &copyState
+}
+
+func (a *Auth) ProxyInfo() string {
+	if a == nil {
+		return ""
+	}
+	proxyStr := strings.TrimSpace(a.ProxyURL)
+	if proxyStr == "" {
+		return ""
+	}
+	if idx := strings.Index(proxyStr, "://"); idx > 0 {
+		return "via " + proxyStr[:idx] + " proxy"
+	}
+	return "via proxy"
 }
 
 func (a *Auth) AccountInfo() (string, string) {
@@ -152,11 +214,29 @@ func (a *Auth) AccountInfo() (string, string) {
 			}
 		}
 	}
-	if a.Metadata != nil {
-		if v, ok := a.Metadata["email"].(string); ok {
-			return "oauth", v
+
+	// For iFlow provider, prioritize OAuth type if email is present
+	if strings.ToLower(a.Provider) == "iflow" {
+		if a.Metadata != nil {
+			if email, ok := a.Metadata["email"].(string); ok {
+				email = strings.TrimSpace(email)
+				if email != "" {
+					return "oauth", email
+				}
+			}
 		}
 	}
+
+	// Check metadata for email first (OAuth-style auth)
+	if a.Metadata != nil {
+		if v, ok := a.Metadata["email"].(string); ok {
+			email := strings.TrimSpace(v)
+			if email != "" {
+				return "oauth", email
+			}
+		}
+	}
+	// Fall back to API key (API-key auth)
 	if a.Attributes != nil {
 		if v := a.Attributes["api_key"]; v != "" {
 			return "api_key", v
@@ -259,6 +339,7 @@ func parseTimeValue(v any) (time.Time, bool) {
 			time.RFC3339,
 			time.RFC3339Nano,
 			"2006-01-02 15:04:05",
+			"2006-01-02 15:04",
 			"2006-01-02T15:04:05Z07:00",
 		}
 		for _, layout := range layouts {

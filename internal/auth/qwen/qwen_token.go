@@ -4,6 +4,11 @@
 package qwen
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/accounts"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 )
@@ -22,6 +27,8 @@ type QwenTokenStorage struct {
 	ResourceURL string `json:"resource_url"`
 	// Email is the Qwen account email address associated with this token.
 	Email string `json:"email"`
+	// AccountID is the Qwen account identifier associated with this token.
+	AccountID string `json:"account_id"`
 	// Type indicates the authentication provider type, always "qwen" for this storage.
 	Type string `json:"type"`
 	// Expire is the timestamp when the current access token expires.
@@ -39,20 +46,42 @@ type QwenTokenStorage struct {
 //   - error: An error if the operation fails, nil otherwise
 func (ts *QwenTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	accountID := "qwen"
-	return accounts.SaveProviderAccount("qwen", accountID, func(existing map[string]any) map[string]any {
-		for k, v := range map[string]any{
-			"access_token":  ts.AccessToken,
-			"refresh_token": ts.RefreshToken,
-			"last_refresh":  ts.LastRefresh,
-			"resource_url":  ts.ResourceURL,
-			"expired":       ts.Expire,
-		} {
-			if s, ok := v.(string); ok && s == "" {
-				continue
+	ts.Type = "qwen"
+
+	if ts.AccountID != "" {
+		return accounts.SaveProviderAccount("qwen", ts.AccountID, func(existing map[string]any) map[string]any {
+			for k, v := range map[string]any{
+				"access_token":  ts.AccessToken,
+				"refresh_token": ts.RefreshToken,
+				"last_refresh":  ts.LastRefresh,
+				"resource_url":  ts.ResourceURL,
+				"email":         ts.Email,
+				"expired":       ts.Expire,
+				"type":          ts.Type,
+			} {
+				if s, ok := v.(string); ok && s == "" {
+					continue
+				}
+				existing[k] = v
 			}
-			existing[k] = v
-		}
-		return existing
-	})
+			return existing
+		})
+	}
+
+	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
+	}
+
+	f, err := os.Create(authFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create token file: %w", err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	if err = json.NewEncoder(f).Encode(ts); err != nil {
+		return fmt.Errorf("failed to write token to file: %w", err)
+	}
+	return nil
 }

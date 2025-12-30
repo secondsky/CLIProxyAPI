@@ -55,30 +55,44 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 
 	ctx := context.Background()
 
+	promptFn := options.Prompt
+	if promptFn == nil {
+		promptFn = defaultProjectPrompt()
+	}
+
+	trimmedProjectID := strings.TrimSpace(projectID)
+	callbackPrompt := promptFn
+	if trimmedProjectID == "" {
+		callbackPrompt = nil
+	}
+
 	loginOpts := &sdkAuth.LoginOptions{
 		NoBrowser: options.NoBrowser,
-		ProjectID: strings.TrimSpace(projectID),
+		ProjectID: trimmedProjectID,
 		Metadata:  map[string]string{},
-		Prompt:    options.Prompt,
+		Prompt:    callbackPrompt,
 	}
 
 	authenticator := sdkAuth.NewGeminiAuthenticator()
 	record, errLogin := authenticator.Login(ctx, cfg, loginOpts)
 	if errLogin != nil {
-		log.Fatalf("Gemini authentication failed: %v", errLogin)
+		log.Errorf("Gemini authentication failed: %v", errLogin)
 		return
 	}
 
 	storage, okStorage := record.Storage.(*gemini.GeminiTokenStorage)
 	if !okStorage || storage == nil {
-		log.Fatal("Gemini authentication failed: unsupported token storage")
+		log.Error("Gemini authentication failed: unsupported token storage")
 		return
 	}
 
 	geminiAuth := gemini.NewGeminiAuth()
-	httpClient, errClient := geminiAuth.GetAuthenticatedClient(ctx, storage, cfg, options.NoBrowser)
+	httpClient, errClient := geminiAuth.GetAuthenticatedClient(ctx, storage, cfg, &gemini.WebLoginOptions{
+		NoBrowser: options.NoBrowser,
+		Prompt:    callbackPrompt,
+	})
 	if errClient != nil {
-		log.Fatalf("Gemini authentication failed: %v", errClient)
+		log.Errorf("Gemini authentication failed: %v", errClient)
 		return
 	}
 
@@ -86,45 +100,57 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 
 	projects, errProjects := fetchGCPProjects(ctx, httpClient)
 	if errProjects != nil {
-		log.Fatalf("Failed to get project list: %v", errProjects)
+		log.Errorf("Failed to get project list: %v", errProjects)
 		return
 	}
 
-	promptFn := options.Prompt
-	if promptFn == nil {
-		promptFn = defaultProjectPrompt()
+	selectedProjectID := promptForProjectSelection(projects, trimmedProjectID, promptFn)
+	projectSelections, errSelection := resolveProjectSelections(selectedProjectID, projects)
+	if errSelection != nil {
+		log.Errorf("Invalid project selection: %v", errSelection)
+		return
 	}
-
-	selectedProjectID := promptForProjectSelection(projects, strings.TrimSpace(projectID), promptFn)
-	if strings.TrimSpace(selectedProjectID) == "" {
-		log.Fatal("No project selected; aborting login.")
+	if len(projectSelections) == 0 {
+		log.Error("No project selected; aborting login.")
 		return
 	}
 
-	if errSetup := performGeminiCLISetup(ctx, httpClient, storage, selectedProjectID); errSetup != nil {
-		var projectErr *projectSelectionRequiredError
-		if errors.As(errSetup, &projectErr) {
-			log.Error("Failed to start user onboarding: A project ID is required.")
-			showProjectSelectionHelp(storage.Email, projects)
+	activatedProjects := make([]string, 0, len(projectSelections))
+	for _, candidateID := range projectSelections {
+		log.Infof("Activating project %s", candidateID)
+		if errSetup := performGeminiCLISetup(ctx, httpClient, storage, candidateID); errSetup != nil {
+			var projectErr *projectSelectionRequiredError
+			if errors.As(errSetup, &projectErr) {
+				log.Error("Failed to start user onboarding: A project ID is required.")
+				showProjectSelectionHelp(storage.Email, projects)
+				return
+			}
+			log.Errorf("Failed to complete user setup: %v", errSetup)
 			return
 		}
-		log.Fatalf("Failed to complete user setup: %v", errSetup)
-		return
+		finalID := strings.TrimSpace(storage.ProjectID)
+		if finalID == "" {
+			finalID = candidateID
+		}
+		activatedProjects = append(activatedProjects, finalID)
 	}
 
 	storage.Auto = false
+	storage.ProjectID = strings.Join(activatedProjects, ",")
 
 	if !storage.Auto && !storage.Checked {
-		isChecked, errCheck := checkCloudAPIIsEnabled(ctx, httpClient, storage.ProjectID)
-		if errCheck != nil {
-			log.Fatalf("Failed to check if Cloud AI API is enabled: %v", errCheck)
-			return
+		for _, pid := range activatedProjects {
+			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, httpClient, pid)
+			if errCheck != nil {
+				log.Errorf("Failed to check if Cloud AI API is enabled for %s: %v", pid, errCheck)
+				return
+			}
+			if !isChecked {
+				log.Errorf("Failed to check if Cloud AI API is enabled for project %s. If you encounter an error message, please create an issue.", pid)
+				return
+			}
 		}
-		storage.Checked = isChecked
-		if !isChecked {
-			log.Fatal("Failed to check if Cloud AI API is enabled. If you encounter an error message, please create an issue.")
-			return
-		}
+		storage.Checked = true
 	}
 
 	updateAuthRecord(record, storage)
@@ -136,7 +162,7 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 
 	savedPath, errSave := store.Save(ctx, record)
 	if errSave != nil {
-		log.Fatalf("Failed to save token to file: %v", errSave)
+		log.Errorf("Failed to save token to file: %v", errSave)
 		return
 	}
 
@@ -354,10 +380,14 @@ func promptForProjectSelection(projects []interfaces.GCPProjectProjects, presetI
 			defaultIndex = idx
 		}
 	}
+	fmt.Println("Type 'ALL' to onboard every listed project.")
 
 	defaultID := projects[defaultIndex].ProjectID
 
 	if trimmedPreset != "" {
+		if strings.EqualFold(trimmedPreset, "ALL") {
+			return "ALL"
+		}
 		for _, project := range projects {
 			if project.ProjectID == trimmedPreset {
 				return trimmedPreset
@@ -367,13 +397,16 @@ func promptForProjectSelection(projects []interfaces.GCPProjectProjects, presetI
 	}
 
 	for {
-		promptMsg := fmt.Sprintf("Enter project ID [%s]: ", defaultID)
+		promptMsg := fmt.Sprintf("Enter project ID [%s] or ALL: ", defaultID)
 		answer, errPrompt := promptFn(promptMsg)
 		if errPrompt != nil {
 			log.Errorf("Project selection prompt failed: %v", errPrompt)
 			return defaultID
 		}
 		answer = strings.TrimSpace(answer)
+		if strings.EqualFold(answer, "ALL") {
+			return "ALL"
+		}
 		if answer == "" {
 			return defaultID
 		}
@@ -392,6 +425,52 @@ func promptForProjectSelection(projects []interfaces.GCPProjectProjects, presetI
 
 		fmt.Println("Invalid selection, enter a project ID or a number from the list.")
 	}
+}
+
+func resolveProjectSelections(selection string, projects []interfaces.GCPProjectProjects) ([]string, error) {
+	trimmed := strings.TrimSpace(selection)
+	if trimmed == "" {
+		return nil, nil
+	}
+	available := make(map[string]struct{}, len(projects))
+	ordered := make([]string, 0, len(projects))
+	for _, project := range projects {
+		id := strings.TrimSpace(project.ProjectID)
+		if id == "" {
+			continue
+		}
+		if _, exists := available[id]; exists {
+			continue
+		}
+		available[id] = struct{}{}
+		ordered = append(ordered, id)
+	}
+	if strings.EqualFold(trimmed, "ALL") {
+		if len(ordered) == 0 {
+			return nil, fmt.Errorf("no projects available for ALL selection")
+		}
+		return append([]string(nil), ordered...), nil
+	}
+	parts := strings.Split(trimmed, ",")
+	selections := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		if len(available) > 0 {
+			if _, ok := available[id]; !ok {
+				return nil, fmt.Errorf("project %s not found in available projects", id)
+			}
+		}
+		seen[id] = struct{}{}
+		selections = append(selections, id)
+	}
+	return selections, nil
 }
 
 func defaultProjectPrompt() func(string) (string, error) {
@@ -485,6 +564,7 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 				continue
 			}
 		}
+		_ = resp.Body.Close()
 		return false, fmt.Errorf("project activation required: %s", errMessage)
 	}
 	return true, nil
@@ -495,7 +575,7 @@ func updateAuthRecord(record *cliproxyauth.Auth, storage *gemini.GeminiTokenStor
 		return
 	}
 
-	finalName := fmt.Sprintf("%s-%s.json", storage.Email, storage.ProjectID)
+	finalName := gemini.CredentialFileName(storage.Email, storage.ProjectID, false)
 
 	if record.Metadata == nil {
 		record.Metadata = make(map[string]any)

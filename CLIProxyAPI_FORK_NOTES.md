@@ -5,7 +5,7 @@ This fork adds VibeProxy-compatible multi-account auth handling plus a determini
 Key behaviors
 - Per-account auth files in `~/.cli-proxy-api` named `provider-accountId.json`.
 - `type` and `accountId` always set; legacy files (`provider.json`) still read as single accounts.
-- Active account chosen via `~/.cli-proxy-api/active-accounts.json` (provider -> id/email/filename hints), with graceful fallback.
+- Active account chosen via `~/.cli-proxy-api/active-accounts.json` (provider -> id/email/filename hints), with graceful fallback. Only applied when using the default auth dir; legacy single-file auth still works.
 - Expired accounts (via `expired`) avoided when valid accounts exist.
 - `accountNickname` and unknown fields preserved when updating files.
 
@@ -16,7 +16,7 @@ Implementation highlights
   - Loads `active-accounts.json` and resolves active account per provider with VibeProxy-compatible matching rules.
   - `SaveProviderAccount` writes/merges `provider-accountId.json` preserving metadata.
 - Provider auth storages (Codex, Claude, Gemini, Qwen) now save via `SaveProviderAccount` using stable IDs (e.g. account id/email) instead of single global files.
-- Request executors are wired to use resolved accounts (and fall back to legacy env/config behavior when needed).
+- Watcher synthesizer prefers multi-account files and `active-accounts.json` when the auth dir is default, then falls back to legacy single-file auths to avoid duplicates.
 
 Binary artifact
 - Standard build target for automation:

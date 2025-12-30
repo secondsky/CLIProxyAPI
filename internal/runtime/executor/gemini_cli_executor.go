@@ -1,3 +1,6 @@
+// Package executor provides runtime execution capabilities for various AI service providers.
+// This file implements the Gemini CLI executor that talks to Cloud Code Assist endpoints
+// using OAuth credentials from auth metadata.
 package executor
 
 import (
@@ -8,12 +11,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -28,11 +34,11 @@ import (
 const (
 	codeAssistEndpoint      = "https://cloudcode-pa.googleapis.com"
 	codeAssistVersion       = "v1internal"
-	geminiOauthClientID     = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
-	geminiOauthClientSecret = "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"
+	geminiOAuthClientID     = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+	geminiOAuthClientSecret = "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"
 )
 
-var geminiOauthScopes = []string{
+var geminiOAuthScopes = []string{
 	"https://www.googleapis.com/auth/cloud-platform",
 	"https://www.googleapis.com/auth/userinfo.email",
 	"https://www.googleapis.com/auth/userinfo.profile",
@@ -43,14 +49,24 @@ type GeminiCLIExecutor struct {
 	cfg *config.Config
 }
 
+// NewGeminiCLIExecutor creates a new Gemini CLI executor instance.
+//
+// Parameters:
+//   - cfg: The application configuration
+//
+// Returns:
+//   - *GeminiCLIExecutor: A new Gemini CLI executor instance
 func NewGeminiCLIExecutor(cfg *config.Config) *GeminiCLIExecutor {
 	return &GeminiCLIExecutor{cfg: cfg}
 }
 
+// Identifier returns the executor identifier.
 func (e *GeminiCLIExecutor) Identifier() string { return "gemini-cli" }
 
+// PrepareRequest prepares the HTTP request for execution (no-op for Gemini CLI).
 func (e *GeminiCLIExecutor) PrepareRequest(_ *http.Request, _ *cliproxyauth.Auth) error { return nil }
 
+// Execute performs a non-streaming request to the Gemini CLI API.
 func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	tokenSource, baseTokenData, err := prepareGeminiCLITokenSource(ctx, e.cfg, auth)
 	if err != nil {
@@ -61,17 +77,14 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("gemini-cli")
-	budgetOverride, includeOverride, hasOverride := util.GeminiThinkingFromMetadata(req.Metadata)
 	basePayload := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
-	if hasOverride && util.ModelSupportsThinking(req.Model) {
-		if budgetOverride != nil {
-			norm := util.NormalizeThinkingBudget(req.Model, *budgetOverride)
-			budgetOverride = &norm
-		}
-		basePayload = util.ApplyGeminiCLIThinkingConfig(basePayload, budgetOverride, includeOverride)
-	}
+	basePayload = applyThinkingMetadataCLI(basePayload, req.Metadata, req.Model)
+	basePayload = util.ApplyGemini3ThinkingLevelFromMetadataCLI(req.Model, req.Metadata, basePayload)
+	basePayload = util.ApplyDefaultThinkingIfNeededCLI(req.Model, basePayload)
+	basePayload = util.NormalizeGeminiCLIThinkingBudget(req.Model, basePayload)
 	basePayload = util.StripThinkingConfigIfUnsupported(req.Model, basePayload)
 	basePayload = fixGeminiCLIImageAspectRatio(req.Model, basePayload)
+	basePayload = applyPayloadConfigWithRoot(e.cfg, req.Model, "gemini", "request", basePayload)
 
 	action := "generateContent"
 	if req.Metadata != nil {
@@ -80,7 +93,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		}
 	}
 
-	projectID := strings.TrimSpace(stringValue(auth.Metadata, "project_id"))
+	projectID := resolveGeminiProjectID(auth)
 	models := cliPreviewFallbackOrder(req.Model)
 	if len(models) == 0 || models[0] != req.Model {
 		models = append([]string{req.Model}, models...)
@@ -178,7 +191,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 			continue
 		}
 
-		err = statusErr{code: httpResp.StatusCode, msg: string(data)}
+		err = newGeminiStatusErr(httpResp.StatusCode, data)
 		return resp, err
 	}
 
@@ -188,10 +201,11 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if lastStatus == 0 {
 		lastStatus = 429
 	}
-	err = statusErr{code: lastStatus, msg: string(lastBody)}
+	err = newGeminiStatusErr(lastStatus, lastBody)
 	return resp, err
 }
 
+// ExecuteStream performs a streaming request to the Gemini CLI API.
 func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (stream <-chan cliproxyexecutor.StreamChunk, err error) {
 	tokenSource, baseTokenData, err := prepareGeminiCLITokenSource(ctx, e.cfg, auth)
 	if err != nil {
@@ -202,19 +216,16 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("gemini-cli")
-	budgetOverride, includeOverride, hasOverride := util.GeminiThinkingFromMetadata(req.Metadata)
 	basePayload := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
-	if hasOverride && util.ModelSupportsThinking(req.Model) {
-		if budgetOverride != nil {
-			norm := util.NormalizeThinkingBudget(req.Model, *budgetOverride)
-			budgetOverride = &norm
-		}
-		basePayload = util.ApplyGeminiCLIThinkingConfig(basePayload, budgetOverride, includeOverride)
-	}
+	basePayload = applyThinkingMetadataCLI(basePayload, req.Metadata, req.Model)
+	basePayload = util.ApplyGemini3ThinkingLevelFromMetadataCLI(req.Model, req.Metadata, basePayload)
+	basePayload = util.ApplyDefaultThinkingIfNeededCLI(req.Model, basePayload)
+	basePayload = util.NormalizeGeminiCLIThinkingBudget(req.Model, basePayload)
 	basePayload = util.StripThinkingConfigIfUnsupported(req.Model, basePayload)
 	basePayload = fixGeminiCLIImageAspectRatio(req.Model, basePayload)
+	basePayload = applyPayloadConfigWithRoot(e.cfg, req.Model, "gemini", "request", basePayload)
 
-	projectID := strings.TrimSpace(stringValue(auth.Metadata, "project_id"))
+	projectID := resolveGeminiProjectID(auth)
 
 	models := cliPreviewFallbackOrder(req.Model)
 	if len(models) == 0 || models[0] != req.Model {
@@ -301,13 +312,13 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 				}
 				continue
 			}
-			err = statusErr{code: httpResp.StatusCode, msg: string(data)}
+			err = newGeminiStatusErr(httpResp.StatusCode, data)
 			return nil, err
 		}
 
 		out := make(chan cliproxyexecutor.StreamChunk)
 		stream = out
-		go func(resp *http.Response, reqBody []byte, attempt string) {
+		go func(resp *http.Response, reqBody []byte, attemptModel string) {
 			defer close(out)
 			defer func() {
 				if errClose := resp.Body.Close(); errClose != nil {
@@ -316,8 +327,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			}()
 			if opts.Alt == "" {
 				scanner := bufio.NewScanner(resp.Body)
-				buf := make([]byte, 20_971_520)
-				scanner.Buffer(buf, 20_971_520)
+				scanner.Buffer(nil, streamScannerBuffer)
 				var param any
 				for scanner.Scan() {
 					line := scanner.Bytes()
@@ -326,14 +336,14 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 						reporter.publish(ctx, detail)
 					}
 					if bytes.HasPrefix(line, dataTag) {
-						segments := sdktranslator.TranslateStream(respCtx, to, from, attempt, bytes.Clone(opts.OriginalRequest), reqBody, bytes.Clone(line), &param)
+						segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, bytes.Clone(opts.OriginalRequest), reqBody, bytes.Clone(line), &param)
 						for i := range segments {
 							out <- cliproxyexecutor.StreamChunk{Payload: []byte(segments[i])}
 						}
 					}
 				}
 
-				segments := sdktranslator.TranslateStream(respCtx, to, from, attempt, bytes.Clone(opts.OriginalRequest), reqBody, bytes.Clone([]byte("[DONE]")), &param)
+				segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, bytes.Clone(opts.OriginalRequest), reqBody, bytes.Clone([]byte("[DONE]")), &param)
 				for i := range segments {
 					out <- cliproxyexecutor.StreamChunk{Payload: []byte(segments[i])}
 				}
@@ -355,12 +365,12 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			appendAPIResponseChunk(ctx, e.cfg, data)
 			reporter.publish(ctx, parseGeminiCLIUsage(data))
 			var param any
-			segments := sdktranslator.TranslateStream(respCtx, to, from, attempt, bytes.Clone(opts.OriginalRequest), reqBody, data, &param)
+			segments := sdktranslator.TranslateStream(respCtx, to, from, attemptModel, bytes.Clone(opts.OriginalRequest), reqBody, data, &param)
 			for i := range segments {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(segments[i])}
 			}
 
-			segments = sdktranslator.TranslateStream(respCtx, to, from, attempt, bytes.Clone(opts.OriginalRequest), reqBody, bytes.Clone([]byte("[DONE]")), &param)
+			segments = sdktranslator.TranslateStream(respCtx, to, from, attemptModel, bytes.Clone(opts.OriginalRequest), reqBody, bytes.Clone([]byte("[DONE]")), &param)
 			for i := range segments {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(segments[i])}
 			}
@@ -375,10 +385,11 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if lastStatus == 0 {
 		lastStatus = 429
 	}
-	err = statusErr{code: lastStatus, msg: string(lastBody)}
+	err = newGeminiStatusErr(lastStatus, lastBody)
 	return nil, err
 }
 
+// CountTokens counts tokens for the given request using the Gemini CLI API.
 func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	tokenSource, baseTokenData, err := prepareGeminiCLITokenSource(ctx, e.cfg, auth)
 	if err != nil {
@@ -406,21 +417,17 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 	var lastStatus int
 	var lastBody []byte
 
-	budgetOverride, includeOverride, hasOverride := util.GeminiThinkingFromMetadata(req.Metadata)
+	// The loop variable attemptModel is only used as the concrete model id sent to the upstream
+	// Gemini CLI endpoint when iterating fallback variants.
 	for _, attemptModel := range models {
 		payload := sdktranslator.TranslateRequest(from, to, attemptModel, bytes.Clone(req.Payload), false)
-		if hasOverride && util.ModelSupportsThinking(req.Model) {
-			if budgetOverride != nil {
-				norm := util.NormalizeThinkingBudget(req.Model, *budgetOverride)
-				budgetOverride = &norm
-			}
-			payload = util.ApplyGeminiCLIThinkingConfig(payload, budgetOverride, includeOverride)
-		}
+		payload = applyThinkingMetadataCLI(payload, req.Metadata, req.Model)
+		payload = util.ApplyGemini3ThinkingLevelFromMetadataCLI(req.Model, req.Metadata, payload)
 		payload = deleteJSONField(payload, "project")
 		payload = deleteJSONField(payload, "model")
 		payload = deleteJSONField(payload, "request.safetySettings")
 		payload = util.StripThinkingConfigIfUnsupported(req.Model, payload)
-		payload = fixGeminiCLIImageAspectRatio(attemptModel, payload)
+		payload = fixGeminiCLIImageAspectRatio(req.Model, payload)
 
 		tok, errTok := tokenSource.Token()
 		if errTok != nil {
@@ -483,22 +490,22 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 	if lastStatus == 0 {
 		lastStatus = 429
 	}
-	return cliproxyexecutor.Response{}, statusErr{code: lastStatus, msg: string(lastBody)}
+	return cliproxyexecutor.Response{}, newGeminiStatusErr(lastStatus, lastBody)
 }
 
-func (e *GeminiCLIExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	log.Debugf("gemini cli executor: refresh called")
-	_ = ctx
+// Refresh refreshes the authentication credentials (no-op for Gemini CLI).
+func (e *GeminiCLIExecutor) Refresh(_ context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	return auth, nil
 }
 
 func prepareGeminiCLITokenSource(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (oauth2.TokenSource, map[string]any, error) {
-	if auth == nil || auth.Metadata == nil {
+	metadata := geminiOAuthMetadata(auth)
+	if auth == nil || metadata == nil {
 		return nil, nil, fmt.Errorf("gemini-cli auth metadata missing")
 	}
 
 	var base map[string]any
-	if tokenRaw, ok := auth.Metadata["token"].(map[string]any); ok && tokenRaw != nil {
+	if tokenRaw, ok := metadata["token"].(map[string]any); ok && tokenRaw != nil {
 		base = cloneMap(tokenRaw)
 	} else {
 		base = make(map[string]any)
@@ -512,16 +519,16 @@ func prepareGeminiCLITokenSource(ctx context.Context, cfg *config.Config, auth *
 	}
 
 	if token.AccessToken == "" {
-		token.AccessToken = stringValue(auth.Metadata, "access_token")
+		token.AccessToken = stringValue(metadata, "access_token")
 	}
 	if token.RefreshToken == "" {
-		token.RefreshToken = stringValue(auth.Metadata, "refresh_token")
+		token.RefreshToken = stringValue(metadata, "refresh_token")
 	}
 	if token.TokenType == "" {
-		token.TokenType = stringValue(auth.Metadata, "token_type")
+		token.TokenType = stringValue(metadata, "token_type")
 	}
 	if token.Expiry.IsZero() {
-		if expiry := stringValue(auth.Metadata, "expiry"); expiry != "" {
+		if expiry := stringValue(metadata, "expiry"); expiry != "" {
 			if ts, err := time.Parse(time.RFC3339, expiry); err == nil {
 				token.Expiry = ts
 			}
@@ -529,9 +536,9 @@ func prepareGeminiCLITokenSource(ctx context.Context, cfg *config.Config, auth *
 	}
 
 	conf := &oauth2.Config{
-		ClientID:     geminiOauthClientID,
-		ClientSecret: geminiOauthClientSecret,
-		Scopes:       geminiOauthScopes,
+		ClientID:     geminiOAuthClientID,
+		ClientSecret: geminiOAuthClientSecret,
+		Scopes:       geminiOAuthScopes,
 		Endpoint:     google.Endpoint,
 	}
 
@@ -550,22 +557,28 @@ func prepareGeminiCLITokenSource(ctx context.Context, cfg *config.Config, auth *
 }
 
 func updateGeminiCLITokenMetadata(auth *cliproxyauth.Auth, base map[string]any, tok *oauth2.Token) {
-	if auth == nil || auth.Metadata == nil || tok == nil {
+	if auth == nil || tok == nil {
 		return
 	}
-	if tok.AccessToken != "" {
-		auth.Metadata["access_token"] = tok.AccessToken
+	merged := buildGeminiTokenMap(base, tok)
+	fields := buildGeminiTokenFields(tok, merged)
+	shared := geminicli.ResolveSharedCredential(auth.Runtime)
+	if shared != nil {
+		snapshot := shared.MergeMetadata(fields)
+		if !geminicli.IsVirtual(auth.Runtime) {
+			auth.Metadata = snapshot
+		}
+		return
 	}
-	if tok.TokenType != "" {
-		auth.Metadata["token_type"] = tok.TokenType
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
 	}
-	if tok.RefreshToken != "" {
-		auth.Metadata["refresh_token"] = tok.RefreshToken
+	for k, v := range fields {
+		auth.Metadata[k] = v
 	}
-	if !tok.Expiry.IsZero() {
-		auth.Metadata["expiry"] = tok.Expiry.Format(time.RFC3339)
-	}
+}
 
+func buildGeminiTokenMap(base map[string]any, tok *oauth2.Token) map[string]any {
 	merged := cloneMap(base)
 	if merged == nil {
 		merged = make(map[string]any)
@@ -578,8 +591,51 @@ func updateGeminiCLITokenMetadata(auth *cliproxyauth.Auth, base map[string]any, 
 			}
 		}
 	}
+	return merged
+}
 
-	auth.Metadata["token"] = merged
+func buildGeminiTokenFields(tok *oauth2.Token, merged map[string]any) map[string]any {
+	fields := make(map[string]any, 5)
+	if tok.AccessToken != "" {
+		fields["access_token"] = tok.AccessToken
+	}
+	if tok.TokenType != "" {
+		fields["token_type"] = tok.TokenType
+	}
+	if tok.RefreshToken != "" {
+		fields["refresh_token"] = tok.RefreshToken
+	}
+	if !tok.Expiry.IsZero() {
+		fields["expiry"] = tok.Expiry.Format(time.RFC3339)
+	}
+	if len(merged) > 0 {
+		fields["token"] = cloneMap(merged)
+	}
+	return fields
+}
+
+func resolveGeminiProjectID(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if runtime := auth.Runtime; runtime != nil {
+		if virtual, ok := runtime.(*geminicli.VirtualCredential); ok && virtual != nil {
+			return strings.TrimSpace(virtual.ProjectID)
+		}
+	}
+	return strings.TrimSpace(stringValue(auth.Metadata, "project_id"))
+}
+
+func geminiOAuthMetadata(auth *cliproxyauth.Auth) map[string]any {
+	if auth == nil {
+		return nil
+	}
+	if shared := geminicli.ResolveSharedCredential(auth.Runtime); shared != nil {
+		if snapshot := shared.MetadataSnapshot(); len(snapshot) > 0 {
+			return snapshot
+		}
+	}
+	return auth.Metadata
 }
 
 func newHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
@@ -636,7 +692,7 @@ func cliPreviewFallbackOrder(model string) []string {
 	case "gemini-2.5-pro":
 		return []string{
 			// "gemini-2.5-pro-preview-05-06",
-			"gemini-2.5-pro-preview-06-05",
+			// "gemini-2.5-pro-preview-06-05",
 		}
 	case "gemini-2.5-flash":
 		return []string{
@@ -716,4 +772,68 @@ func fixGeminiCLIImageAspectRatio(modelName string, rawJSON []byte) []byte {
 		}
 	}
 	return rawJSON
+}
+
+func newGeminiStatusErr(statusCode int, body []byte) statusErr {
+	err := statusErr{code: statusCode, msg: string(body)}
+	if statusCode == http.StatusTooManyRequests {
+		if retryAfter, parseErr := parseRetryDelay(body); parseErr == nil && retryAfter != nil {
+			err.retryAfter = retryAfter
+		}
+	}
+	return err
+}
+
+// parseRetryDelay extracts the retry delay from a Google API 429 error response.
+// The error response contains a RetryInfo.retryDelay field in the format "0.847655010s".
+// Returns the parsed duration or an error if it cannot be determined.
+func parseRetryDelay(errorBody []byte) (*time.Duration, error) {
+	// Try to parse the retryDelay from the error response
+	// Format: error.details[].retryDelay where @type == "type.googleapis.com/google.rpc.RetryInfo"
+	details := gjson.GetBytes(errorBody, "error.details")
+	if details.Exists() && details.IsArray() {
+		for _, detail := range details.Array() {
+			typeVal := detail.Get("@type").String()
+			if typeVal == "type.googleapis.com/google.rpc.RetryInfo" {
+				retryDelay := detail.Get("retryDelay").String()
+				if retryDelay != "" {
+					// Parse duration string like "0.847655010s"
+					duration, err := time.ParseDuration(retryDelay)
+					if err != nil {
+						return nil, fmt.Errorf("failed to parse duration")
+					}
+					return &duration, nil
+				}
+			}
+		}
+
+		// Fallback: try ErrorInfo.metadata.quotaResetDelay (e.g., "373.801628ms")
+		for _, detail := range details.Array() {
+			typeVal := detail.Get("@type").String()
+			if typeVal == "type.googleapis.com/google.rpc.ErrorInfo" {
+				quotaResetDelay := detail.Get("metadata.quotaResetDelay").String()
+				if quotaResetDelay != "" {
+					duration, err := time.ParseDuration(quotaResetDelay)
+					if err == nil {
+						return &duration, nil
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback: parse from error.message "Your quota will reset after Xs."
+	message := gjson.GetBytes(errorBody, "error.message").String()
+	if message != "" {
+		re := regexp.MustCompile(`after\s+(\d+)s\.?`)
+		if matches := re.FindStringSubmatch(message); len(matches) > 1 {
+			seconds, err := strconv.Atoi(matches[1])
+			if err == nil {
+				duration := time.Duration(seconds) * time.Second
+				return &duration, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no RetryInfo found")
 }

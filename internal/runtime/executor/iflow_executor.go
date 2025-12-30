@@ -57,6 +57,15 @@ func (e *IFlowExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning_effort", false)
+	body, _ = sjson.SetBytes(body, "model", req.Model)
+	body = NormalizeThinkingConfig(body, req.Model, false)
+	if errValidate := ValidateThinkingConfig(body, req.Model); errValidate != nil {
+		return resp, errValidate
+	}
+	body = applyIFlowThinkingConfig(body)
+	body = preserveReasoningContentInMessages(body)
+	body = applyPayloadConfig(e.cfg, req.Model, body)
 
 	endpoint := strings.TrimSuffix(baseURL, "/") + iflowDefaultEndpoint
 
@@ -111,6 +120,8 @@ func (e *IFlowExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.publish(ctx, parseOpenAIUsage(data))
+	// Ensure usage is recorded even if upstream omits usage metadata.
+	reporter.ensurePublished(ctx)
 
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, data, &param)
@@ -136,11 +147,20 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	to := sdktranslator.FromString("openai")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning_effort", false)
+	body, _ = sjson.SetBytes(body, "model", req.Model)
+	body = NormalizeThinkingConfig(body, req.Model, false)
+	if errValidate := ValidateThinkingConfig(body, req.Model); errValidate != nil {
+		return nil, errValidate
+	}
+	body = applyIFlowThinkingConfig(body)
+	body = preserveReasoningContentInMessages(body)
 	// Ensure tools array exists to avoid provider quirks similar to Qwen's behaviour.
 	toolsResult := gjson.GetBytes(body, "tools")
 	if toolsResult.Exists() && toolsResult.IsArray() && len(toolsResult.Array()) == 0 {
 		body = ensureToolsArray(body)
 	}
+	body = applyPayloadConfig(e.cfg, req.Model, body)
 
 	endpoint := strings.TrimSuffix(baseURL, "/") + iflowDefaultEndpoint
 
@@ -197,8 +217,7 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}()
 
 		scanner := bufio.NewScanner(httpResp.Body)
-		buf := make([]byte, 20_971_520)
-		scanner.Buffer(buf, 20_971_520)
+		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -216,6 +235,8 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			reporter.publishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		}
+		// Guarantee a usage record exists even if the stream never emitted usage data.
+		reporter.ensurePublished(ctx)
 	}()
 
 	return stream, nil
@@ -241,13 +262,87 @@ func (e *IFlowExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	return cliproxyexecutor.Response{Payload: []byte(translated)}, nil
 }
 
-// Refresh refreshes OAuth tokens and updates the stored API key.
+// Refresh refreshes OAuth tokens or cookie-based API keys and updates the stored API key.
 func (e *IFlowExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("iflow executor: refresh called")
 	if auth == nil {
 		return nil, fmt.Errorf("iflow executor: auth is nil")
 	}
 
+	// Check if this is cookie-based authentication
+	var cookie string
+	var email string
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["cookie"].(string); ok {
+			cookie = strings.TrimSpace(v)
+		}
+		if v, ok := auth.Metadata["email"].(string); ok {
+			email = strings.TrimSpace(v)
+		}
+	}
+
+	// If cookie is present, use cookie-based refresh
+	if cookie != "" && email != "" {
+		return e.refreshCookieBased(ctx, auth, cookie, email)
+	}
+
+	// Otherwise, use OAuth-based refresh
+	return e.refreshOAuthBased(ctx, auth)
+}
+
+// refreshCookieBased refreshes API key using browser cookie
+func (e *IFlowExecutor) refreshCookieBased(ctx context.Context, auth *cliproxyauth.Auth, cookie, email string) (*cliproxyauth.Auth, error) {
+	log.Debugf("iflow executor: checking refresh need for cookie-based API key for user: %s", email)
+
+	// Get current expiry time from metadata
+	var currentExpire string
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["expired"].(string); ok {
+			currentExpire = strings.TrimSpace(v)
+		}
+	}
+
+	// Check if refresh is needed
+	needsRefresh, _, err := iflowauth.ShouldRefreshAPIKey(currentExpire)
+	if err != nil {
+		log.Warnf("iflow executor: failed to check refresh need: %v", err)
+		// If we can't check, continue with refresh anyway as a safety measure
+	} else if !needsRefresh {
+		log.Debugf("iflow executor: no refresh needed for user: %s", email)
+		return auth, nil
+	}
+
+	log.Infof("iflow executor: refreshing cookie-based API key for user: %s", email)
+
+	svc := iflowauth.NewIFlowAuth(e.cfg)
+	keyData, err := svc.RefreshAPIKey(ctx, cookie, email)
+	if err != nil {
+		log.Errorf("iflow executor: cookie-based API key refresh failed: %v", err)
+		return nil, err
+	}
+
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["api_key"] = keyData.APIKey
+	auth.Metadata["expired"] = keyData.ExpireTime
+	auth.Metadata["type"] = "iflow"
+	auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+	auth.Metadata["cookie"] = cookie
+	auth.Metadata["email"] = email
+
+	log.Infof("iflow executor: cookie-based API key refreshed successfully, new expiry: %s", keyData.ExpireTime)
+
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes["api_key"] = keyData.APIKey
+
+	return auth, nil
+}
+
+// refreshOAuthBased refreshes tokens using OAuth refresh token
+func (e *IFlowExecutor) refreshOAuthBased(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	refreshToken := ""
 	oldAccessToken := ""
 	if auth.Metadata != nil {
@@ -344,4 +439,100 @@ func ensureToolsArray(body []byte) []byte {
 		return body
 	}
 	return updated
+}
+
+// preserveReasoningContentInMessages ensures reasoning_content from assistant messages in the
+// conversation history is preserved when sending to iFlow models that support thinking.
+// This is critical for multi-turn conversations where the model needs to see its previous
+// reasoning to maintain coherent thought chains across tool calls and conversation turns.
+//
+// For GLM-4.7 and MiniMax-M2.1, the full assistant response (including reasoning) must be
+// appended back into message history before the next call.
+func preserveReasoningContentInMessages(body []byte) []byte {
+	model := strings.ToLower(gjson.GetBytes(body, "model").String())
+
+	// Only apply to models that support thinking with history preservation
+	needsPreservation := strings.HasPrefix(model, "glm-4.7") ||
+		strings.HasPrefix(model, "glm-4-7") ||
+		strings.HasPrefix(model, "minimax-m2.1") ||
+		strings.HasPrefix(model, "minimax-m2-1")
+
+	if !needsPreservation {
+		return body
+	}
+
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+
+	// Check if any assistant message already has reasoning_content preserved
+	hasReasoningContent := false
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		role := msg.Get("role").String()
+		if role == "assistant" {
+			rc := msg.Get("reasoning_content")
+			if rc.Exists() && rc.String() != "" {
+				hasReasoningContent = true
+				return false // stop iteration
+			}
+		}
+		return true
+	})
+
+	// If reasoning content is already present, the messages are properly formatted
+	// No need to modify - the client has correctly preserved reasoning in history
+	if hasReasoningContent {
+		log.Debugf("iflow executor: reasoning_content found in message history for %s", model)
+	}
+
+	return body
+}
+
+// applyIFlowThinkingConfig converts normalized reasoning_effort to model-specific thinking configurations.
+// This should be called after NormalizeThinkingConfig has processed the payload.
+//
+// Model-specific handling:
+//   - GLM-4.7: Uses extra_body={"thinking": {"type": "enabled"}, "clear_thinking": false}
+//   - MiniMax-M2.1: Uses reasoning_split=true for OpenAI-style reasoning separation
+//   - Other iFlow models: Uses chat_template_kwargs.enable_thinking (boolean)
+func applyIFlowThinkingConfig(body []byte) []byte {
+	effort := gjson.GetBytes(body, "reasoning_effort")
+	model := strings.ToLower(gjson.GetBytes(body, "model").String())
+
+	// Check if thinking should be enabled
+	val := ""
+	if effort.Exists() {
+		val = strings.ToLower(strings.TrimSpace(effort.String()))
+	}
+	enableThinking := effort.Exists() && val != "none" && val != ""
+
+	// Remove reasoning_effort as we'll convert to model-specific format
+	if effort.Exists() {
+		body, _ = sjson.DeleteBytes(body, "reasoning_effort")
+	}
+
+	// GLM-4.7: Use extra_body with thinking config and clear_thinking: false
+	if strings.HasPrefix(model, "glm-4.7") || strings.HasPrefix(model, "glm-4-7") {
+		if enableThinking {
+			body, _ = sjson.SetBytes(body, "extra_body.thinking.type", "enabled")
+			body, _ = sjson.SetBytes(body, "extra_body.clear_thinking", false)
+		}
+		return body
+	}
+
+	// MiniMax-M2.1: Use reasoning_split=true for interleaved thinking
+	if strings.HasPrefix(model, "minimax-m2.1") || strings.HasPrefix(model, "minimax-m2-1") {
+		if enableThinking {
+			body, _ = sjson.SetBytes(body, "reasoning_split", true)
+		}
+		return body
+	}
+
+	// Other iFlow models (including GLM-4.6): Use chat_template_kwargs.enable_thinking
+	if effort.Exists() {
+		body, _ = sjson.SetBytes(body, "chat_template_kwargs.enable_thinking", enableThinking)
+	}
+
+	return body
 }

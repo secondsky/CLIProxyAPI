@@ -10,6 +10,8 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+const geminiResponsesThoughtSignature = "skip_thought_signature_validator"
+
 func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte, stream bool) []byte {
 	rawJSON := bytes.Clone(inputRawJSON)
 
@@ -31,7 +33,83 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 	// Convert input messages to Gemini contents format
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
-		input.ForEach(func(_, item gjson.Result) bool {
+		items := input.Array()
+
+		// Normalize consecutive function calls and outputs so each call is immediately followed by its response
+		normalized := make([]gjson.Result, 0, len(items))
+		for i := 0; i < len(items); {
+			item := items[i]
+			itemType := item.Get("type").String()
+			itemRole := item.Get("role").String()
+			if itemType == "" && itemRole != "" {
+				itemType = "message"
+			}
+
+			if itemType == "function_call" {
+				var calls []gjson.Result
+				var outputs []gjson.Result
+
+				for i < len(items) {
+					next := items[i]
+					nextType := next.Get("type").String()
+					nextRole := next.Get("role").String()
+					if nextType == "" && nextRole != "" {
+						nextType = "message"
+					}
+					if nextType != "function_call" {
+						break
+					}
+					calls = append(calls, next)
+					i++
+				}
+
+				for i < len(items) {
+					next := items[i]
+					nextType := next.Get("type").String()
+					nextRole := next.Get("role").String()
+					if nextType == "" && nextRole != "" {
+						nextType = "message"
+					}
+					if nextType != "function_call_output" {
+						break
+					}
+					outputs = append(outputs, next)
+					i++
+				}
+
+				if len(calls) > 0 {
+					outputMap := make(map[string]gjson.Result, len(outputs))
+					for _, out := range outputs {
+						outputMap[out.Get("call_id").String()] = out
+					}
+					for _, call := range calls {
+						normalized = append(normalized, call)
+						callID := call.Get("call_id").String()
+						if resp, ok := outputMap[callID]; ok {
+							normalized = append(normalized, resp)
+							delete(outputMap, callID)
+						}
+					}
+					for _, out := range outputs {
+						if _, ok := outputMap[out.Get("call_id").String()]; ok {
+							normalized = append(normalized, out)
+						}
+					}
+					continue
+				}
+			}
+
+			if itemType == "function_call_output" {
+				normalized = append(normalized, item)
+				i++
+				continue
+			}
+
+			normalized = append(normalized, item)
+			i++
+		}
+
+		for _, item := range normalized {
 			itemType := item.Get("type").String()
 			itemRole := item.Get("role").String()
 			if itemType == "" && itemRole != "" {
@@ -57,7 +135,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 							out, _ = sjson.SetRaw(out, "system_instruction", systemInstr)
 						}
 					}
-					return true
+					continue
 				}
 
 				// Handle regular messages
@@ -65,39 +143,101 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				// even when the message.role is "user". We split such items into distinct Gemini messages
 				// with roles derived from the content type to match docs/convert-2.md.
 				if contentArray := item.Get("content"); contentArray.Exists() && contentArray.IsArray() {
+					currentRole := ""
+					var currentParts []string
+
+					flush := func() {
+						if currentRole == "" || len(currentParts) == 0 {
+							currentParts = nil
+							return
+						}
+						one := `{"role":"","parts":[]}`
+						one, _ = sjson.Set(one, "role", currentRole)
+						for _, part := range currentParts {
+							one, _ = sjson.SetRaw(one, "parts.-1", part)
+						}
+						out, _ = sjson.SetRaw(out, "contents.-1", one)
+						currentParts = nil
+					}
+
 					contentArray.ForEach(func(_, contentItem gjson.Result) bool {
 						contentType := contentItem.Get("type").String()
 						if contentType == "" {
 							contentType = "input_text"
 						}
+
+						effRole := "user"
+						if itemRole != "" {
+							switch strings.ToLower(itemRole) {
+							case "assistant", "model":
+								effRole = "model"
+							default:
+								effRole = strings.ToLower(itemRole)
+							}
+						}
+						if contentType == "output_text" {
+							effRole = "model"
+						}
+						if effRole == "assistant" {
+							effRole = "model"
+						}
+
+						if currentRole != "" && effRole != currentRole {
+							flush()
+							currentRole = ""
+						}
+						if currentRole == "" {
+							currentRole = effRole
+						}
+
+						var partJSON string
 						switch contentType {
 						case "input_text", "output_text":
 							if text := contentItem.Get("text"); text.Exists() {
-								effRole := "user"
-								if itemRole != "" {
-									switch strings.ToLower(itemRole) {
-									case "assistant", "model":
-										effRole = "model"
-									default:
-										effRole = strings.ToLower(itemRole)
+								partJSON = `{"text":""}`
+								partJSON, _ = sjson.Set(partJSON, "text", text.String())
+							}
+						case "input_image":
+							imageURL := contentItem.Get("image_url").String()
+							if imageURL == "" {
+								imageURL = contentItem.Get("url").String()
+							}
+							if imageURL != "" {
+								mimeType := "application/octet-stream"
+								data := ""
+								if strings.HasPrefix(imageURL, "data:") {
+									trimmed := strings.TrimPrefix(imageURL, "data:")
+									mediaAndData := strings.SplitN(trimmed, ";base64,", 2)
+									if len(mediaAndData) == 2 {
+										if mediaAndData[0] != "" {
+											mimeType = mediaAndData[0]
+										}
+										data = mediaAndData[1]
+									} else {
+										mediaAndData = strings.SplitN(trimmed, ",", 2)
+										if len(mediaAndData) == 2 {
+											if mediaAndData[0] != "" {
+												mimeType = mediaAndData[0]
+											}
+											data = mediaAndData[1]
+										}
 									}
 								}
-								if contentType == "output_text" {
-									effRole = "model"
+								if data != "" {
+									partJSON = `{"inline_data":{"mime_type":"","data":""}}`
+									partJSON, _ = sjson.Set(partJSON, "inline_data.mime_type", mimeType)
+									partJSON, _ = sjson.Set(partJSON, "inline_data.data", data)
 								}
-								if effRole == "assistant" {
-									effRole = "model"
-								}
-								one := `{"role":"","parts":[]}`
-								one, _ = sjson.Set(one, "role", effRole)
-								textPart := `{"text":""}`
-								textPart, _ = sjson.Set(textPart, "text", text.String())
-								one, _ = sjson.SetRaw(one, "parts.-1", textPart)
-								out, _ = sjson.SetRaw(out, "contents.-1", one)
 							}
+						}
+
+						if partJSON != "" {
+							currentParts = append(currentParts, partJSON)
 						}
 						return true
 					})
+
+					flush()
 				}
 
 			case "function_call":
@@ -108,6 +248,8 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				modelContent := `{"role":"model","parts":[]}`
 				functionCall := `{"functionCall":{"name":"","args":{}}}`
 				functionCall, _ = sjson.Set(functionCall, "functionCall.name", name)
+				functionCall, _ = sjson.Set(functionCall, "thoughtSignature", geminiResponsesThoughtSignature)
+				functionCall, _ = sjson.Set(functionCall, "functionCall.id", item.Get("call_id").String())
 
 				// Parse arguments JSON string and set as args object
 				if arguments != "" {
@@ -121,7 +263,8 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 			case "function_call_output":
 				// Handle function call outputs - convert to function message with functionResponse
 				callID := item.Get("call_id").String()
-				output := item.Get("output").String()
+				// Use .Raw to preserve the JSON encoding (includes quotes for strings)
+				outputRaw := item.Get("output").Str
 
 				functionContent := `{"role":"function","parts":[]}`
 				functionResponse := `{"functionResponse":{"name":"","response":{}}}`
@@ -143,19 +286,26 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				}
 
 				functionResponse, _ = sjson.Set(functionResponse, "functionResponse.name", functionName)
+				functionResponse, _ = sjson.Set(functionResponse, "functionResponse.id", callID)
 
-				// Parse output JSON string and set as response content
-				if output != "" {
-					outputResult := gjson.Parse(output)
-					functionResponse, _ = sjson.Set(functionResponse, "functionResponse.response.result", outputResult.Raw)
+				// Set the raw JSON output directly (preserves string encoding)
+				if outputRaw != "" && outputRaw != "null" {
+					output := gjson.Parse(outputRaw)
+					if output.Type == gjson.JSON {
+						functionResponse, _ = sjson.SetRaw(functionResponse, "functionResponse.response.result", output.Raw)
+					} else {
+						functionResponse, _ = sjson.Set(functionResponse, "functionResponse.response.result", outputRaw)
+					}
 				}
-
 				functionContent, _ = sjson.SetRaw(functionContent, "parts.-1", functionResponse)
 				out, _ = sjson.SetRaw(out, "contents.-1", functionContent)
 			}
-
-			return true
-		})
+		}
+	} else if input.Exists() && input.Type == gjson.String {
+		// Simple string input conversion to user message
+		userContent := `{"role":"user","parts":[{"text":""}]}`
+		userContent, _ = sjson.Set(userContent, "parts.0.text", input.String())
+		out, _ = sjson.SetRaw(out, "contents.-1", userContent)
 	}
 
 	// Convert tools to Gemini functionDeclarations format
@@ -239,53 +389,34 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	}
 
 	// OpenAI official reasoning fields take precedence
+	// Only convert for models that use numeric budgets (not discrete levels).
 	hasOfficialThinking := root.Get("reasoning.effort").Exists()
-	if hasOfficialThinking && util.ModelSupportsThinking(modelName) {
+	if hasOfficialThinking && util.ModelSupportsThinking(modelName) && !util.ModelUsesThinkingLevels(modelName) {
 		reasoningEffort := root.Get("reasoning.effort")
-		switch reasoningEffort.String() {
-		case "none":
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.include_thoughts", false)
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", 0)
-		case "auto":
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", -1)
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.include_thoughts", true)
-		case "minimal":
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", util.NormalizeThinkingBudget(modelName, 1024))
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.include_thoughts", true)
-		case "low":
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", util.NormalizeThinkingBudget(modelName, 4096))
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.include_thoughts", true)
-		case "medium":
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", util.NormalizeThinkingBudget(modelName, 8192))
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.include_thoughts", true)
-		case "high":
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", util.NormalizeThinkingBudget(modelName, 32768))
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.include_thoughts", true)
-		default:
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", -1)
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.include_thoughts", true)
-		}
+		out = string(util.ApplyReasoningEffortToGemini([]byte(out), reasoningEffort.String()))
 	}
 
 	// Cherry Studio extension (applies only when official fields are missing)
-	if !hasOfficialThinking && util.ModelSupportsThinking(modelName) {
+	// Only apply for models that use numeric budgets, not discrete levels.
+	if !hasOfficialThinking && util.ModelSupportsThinking(modelName) && !util.ModelUsesThinkingLevels(modelName) {
 		if tc := root.Get("extra_body.google.thinking_config"); tc.Exists() && tc.IsObject() {
 			var setBudget bool
-			var normalized int
+			var budget int
 			if v := tc.Get("thinking_budget"); v.Exists() {
-				normalized = util.NormalizeThinkingBudget(modelName, int(v.Int()))
-				out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", normalized)
+				budget = int(v.Int())
+				out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", budget)
 				setBudget = true
 			}
 			if v := tc.Get("include_thoughts"); v.Exists() {
 				out, _ = sjson.Set(out, "generationConfig.thinkingConfig.include_thoughts", v.Bool())
 			} else if setBudget {
-				if normalized != 0 {
+				if budget != 0 {
 					out, _ = sjson.Set(out, "generationConfig.thinkingConfig.include_thoughts", true)
 				}
 			}
 		}
 	}
+
 	result := []byte(out)
 	result = common.AttachDefaultSafetySettings(result, "safetySettings")
 	return result

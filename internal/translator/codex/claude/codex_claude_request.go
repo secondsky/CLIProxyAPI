@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -204,7 +205,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				}
 				tool, _ = sjson.Set(tool, "name", name)
 			}
-			tool, _ = sjson.SetRaw(tool, "parameters", toolResult.Get("input_schema").Raw)
+			tool, _ = sjson.SetRaw(tool, "parameters", normalizeToolParameters(toolResult.Get("input_schema").Raw))
 			tool, _ = sjson.Delete(tool, "input_schema")
 			tool, _ = sjson.Delete(tool, "parameters.$schema")
 			tool, _ = sjson.Set(tool, "strict", false)
@@ -214,7 +215,27 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 
 	// Add additional configuration parameters for the Codex API.
 	template, _ = sjson.Set(template, "parallel_tool_calls", true)
-	template, _ = sjson.Set(template, "reasoning.effort", "low")
+
+	// Convert thinking.budget_tokens to reasoning.effort for level-based models
+	reasoningEffort := "medium" // default
+	if thinking := rootResult.Get("thinking"); thinking.Exists() && thinking.IsObject() {
+		switch thinking.Get("type").String() {
+		case "enabled":
+			if util.ModelUsesThinkingLevels(modelName) {
+				if budgetTokens := thinking.Get("budget_tokens"); budgetTokens.Exists() {
+					budget := int(budgetTokens.Int())
+					if effort, ok := util.ThinkingBudgetToEffort(modelName, budget); ok && effort != "" {
+						reasoningEffort = effort
+					}
+				}
+			}
+		case "disabled":
+			if effort, ok := util.ThinkingBudgetToEffort(modelName, 0); ok && effort != "" {
+				reasoningEffort = effort
+			}
+		}
+	}
+	template, _ = sjson.Set(template, "reasoning.effort", reasoningEffort)
 	template, _ = sjson.Set(template, "reasoning.summary", "auto")
 	template, _ = sjson.Set(template, "stream", true)
 	template, _ = sjson.Set(template, "store", false)
@@ -289,7 +310,7 @@ func buildShortNameMap(names []string) map[string]string {
 		}
 		base := cand
 		for i := 1; ; i++ {
-			suffix := "~" + strconv.Itoa(i)
+			suffix := "_" + strconv.Itoa(i)
 			allowed := limit - len(suffix)
 			if allowed < 0 {
 				allowed = 0
@@ -333,4 +354,23 @@ func buildReverseMapFromClaudeOriginalToShort(original []byte) map[string]string
 		m = buildShortNameMap(names)
 	}
 	return m
+}
+
+// normalizeToolParameters ensures object schemas contain at least an empty properties map.
+func normalizeToolParameters(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" || !gjson.Valid(raw) {
+		return `{"type":"object","properties":{}}`
+	}
+	schema := raw
+	result := gjson.Parse(raw)
+	schemaType := result.Get("type").String()
+	if schemaType == "" {
+		schema, _ = sjson.Set(schema, "type", "object")
+		schemaType = "object"
+	}
+	if schemaType == "object" && !result.Get("properties").Exists() {
+		schema, _ = sjson.SetRaw(schema, "properties", `{}`)
+	}
+	return schema
 }

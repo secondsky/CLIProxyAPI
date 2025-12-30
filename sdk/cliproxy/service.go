@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -23,6 +22,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -146,6 +146,27 @@ func (s *Service) consumeAuthUpdates(ctx context.Context) {
 	}
 }
 
+func (s *Service) emitAuthUpdate(ctx context.Context, update watcher.AuthUpdate) {
+	if s == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.watcher != nil && s.watcher.DispatchRuntimeAuthUpdate(update) {
+		return
+	}
+	if s.authUpdates != nil {
+		select {
+		case s.authUpdates <- update:
+			return
+		default:
+			log.Debugf("auth update queue saturated, applying inline action=%v id=%s", update.Action, update.ID)
+		}
+	}
+	s.handleAuthUpdate(ctx, update)
+}
+
 func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdate) {
 	if s == nil {
 		return
@@ -220,7 +241,11 @@ func (s *Service) wsOnConnected(channelID string) {
 		Metadata:   map[string]any{"email": channelID}, // metadata drives logging and usage tracking
 	}
 	log.Infof("websocket provider connected: %s", channelID)
-	s.applyCoreAuthAddOrUpdate(context.Background(), auth)
+	s.emitAuthUpdate(context.Background(), watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionAdd,
+		ID:     auth.ID,
+		Auth:   auth,
+	})
 }
 
 func (s *Service) wsOnDisconnected(channelID string, reason error) {
@@ -237,7 +262,10 @@ func (s *Service) wsOnDisconnected(channelID string, reason error) {
 		log.Infof("websocket provider disconnected: %s", channelID)
 	}
 	ctx := context.Background()
-	s.applyCoreAuthRemoval(ctx, channelID)
+	s.emitAuthUpdate(ctx, watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionDelete,
+		ID:     channelID,
+	})
 }
 
 func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.Auth) {
@@ -281,6 +309,14 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 	}
 }
 
+func (s *Service) applyRetryConfig(cfg *config.Config) {
+	if s == nil || s.coreManager == nil || cfg == nil {
+		return
+	}
+	maxInterval := time.Duration(cfg.MaxRetryInterval) * time.Second
+	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval)
+}
+
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
 	if a == nil {
 		return "", "", false
@@ -288,7 +324,7 @@ func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName 
 	if len(a.Attributes) > 0 {
 		providerKey = strings.TrimSpace(a.Attributes["provider_key"])
 		compatName = strings.TrimSpace(a.Attributes["compat_name"])
-		if providerKey != "" || compatName != "" {
+		if compatName != "" {
 			if providerKey == "" {
 				providerKey = compatName
 			}
@@ -305,6 +341,12 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 	if s == nil || a == nil {
 		return
 	}
+	// Skip disabled auth entries when (re)binding executors.
+	// Disabled auths can linger during config reloads (e.g., removed OpenAI-compat entries)
+	// and must not override active provider executors (such as iFlow OAuth accounts).
+	if a.Disabled {
+		return
+	}
 	if compatProviderKey, _, isCompat := openAICompatInfoFromAuth(a); isCompat {
 		if compatProviderKey == "" {
 			compatProviderKey = strings.ToLower(strings.TrimSpace(a.Provider))
@@ -318,6 +360,8 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 	switch strings.ToLower(a.Provider) {
 	case "gemini":
 		s.coreManager.RegisterExecutor(executor.NewGeminiExecutor(s.cfg))
+	case "vertex":
+		s.coreManager.RegisterExecutor(executor.NewGeminiVertexExecutor(s.cfg))
 	case "gemini-cli":
 		s.coreManager.RegisterExecutor(executor.NewGeminiCLIExecutor(s.cfg))
 	case "aistudio":
@@ -325,6 +369,8 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 			s.coreManager.RegisterExecutor(executor.NewAIStudioExecutor(s.cfg, a.ID, s.wsGateway))
 		}
 		return
+	case "antigravity":
+		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
 	case "codex":
@@ -383,6 +429,8 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.ensureAuthDir(); err != nil {
 		return err
 	}
+
+	s.applyRetryConfig(s.cfg)
 
 	if s.coreManager != nil {
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
@@ -450,7 +498,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}()
 
 	time.Sleep(100 * time.Millisecond)
-	fmt.Println("API server started successfully")
+	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
 
 	if s.hooks.OnAfterStart != nil {
 		s.hooks.OnAfterStart(s)
@@ -458,6 +506,13 @@ func (s *Service) Run(ctx context.Context) error {
 
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
+		previousStrategy := ""
+		s.cfgMu.RLock()
+		if s.cfg != nil {
+			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+		}
+		s.cfgMu.RUnlock()
+
 		if newCfg == nil {
 			s.cfgMu.RLock()
 			newCfg = s.cfg
@@ -466,12 +521,40 @@ func (s *Service) Run(ctx context.Context) error {
 		if newCfg == nil {
 			return
 		}
+
+		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
+		normalizeStrategy := func(strategy string) string {
+			switch strategy {
+			case "fill-first", "fillfirst", "ff":
+				return "fill-first"
+			default:
+				return "round-robin"
+			}
+		}
+		previousStrategy = normalizeStrategy(previousStrategy)
+		nextStrategy = normalizeStrategy(nextStrategy)
+		if s.coreManager != nil && previousStrategy != nextStrategy {
+			var selector coreauth.Selector
+			switch nextStrategy {
+			case "fill-first":
+				selector = &coreauth.FillFirstSelector{}
+			default:
+				selector = &coreauth.RoundRobinSelector{}
+			}
+			s.coreManager.SetSelector(selector)
+			log.Infof("routing strategy updated to %s", nextStrategy)
+		}
+
+		s.applyRetryConfig(newCfg)
 		if s.server != nil {
 			s.server.UpdateClients(newCfg)
 		}
 		s.cfgMu.Lock()
 		s.cfg = newCfg
 		s.cfgMu.Unlock()
+		if s.coreManager != nil {
+			s.coreManager.SetOAuthModelMappings(newCfg.OAuthModelMappings)
+		}
 		s.rebindExecutors()
 	}
 
@@ -596,6 +679,18 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	if a == nil || a.ID == "" {
 		return
 	}
+	authKind := strings.ToLower(strings.TrimSpace(a.Attributes["auth_kind"]))
+	if authKind == "" {
+		if kind, _ := a.AccountInfo(); strings.EqualFold(kind, "api_key") {
+			authKind = "apikey"
+		}
+	}
+	if a.Attributes != nil {
+		if v := strings.TrimSpace(a.Attributes["gemini_virtual_primary"]); strings.EqualFold(v, "true") {
+			GlobalModelRegistry().UnregisterClient(a.ID)
+			return
+		}
+	}
 	// Unregister legacy client ID (if present) to avoid double counting
 	if a.Runtime != nil {
 		if idGetter, ok := a.Runtime.(interface{ GetClientID() string }); ok {
@@ -609,25 +704,68 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	if compatDetected {
 		provider = "openai-compatibility"
 	}
+	excluded := s.oauthExcludedModels(provider, authKind)
 	var models []*ModelInfo
 	switch provider {
 	case "gemini":
 		models = registry.GetGeminiModels()
+		if entry := s.resolveConfigGeminiKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildGeminiConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
+	case "vertex":
+		// Vertex AI Gemini supports the same model identifiers as Gemini.
+		models = registry.GetGeminiVertexModels()
+		if authKind == "apikey" {
+			if entry := s.resolveConfigVertexCompatKey(a); entry != nil && len(entry.Models) > 0 {
+				models = buildVertexCompatConfigModels(entry)
+			}
+		}
+		models = applyExcludedModels(models, excluded)
 	case "gemini-cli":
 		models = registry.GetGeminiCLIModels()
+		models = applyExcludedModels(models, excluded)
 	case "aistudio":
 		models = registry.GetAIStudioModels()
+		models = applyExcludedModels(models, excluded)
+	case "antigravity":
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		models = executor.FetchAntigravityModels(ctx, a, s.cfg)
+		cancel()
+		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
-		if entry := s.resolveConfigClaudeKey(a); entry != nil && len(entry.Models) > 0 {
-			models = buildClaudeConfigModels(entry)
+		if entry := s.resolveConfigClaudeKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildClaudeConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
 		}
+		models = applyExcludedModels(models, excluded)
 	case "codex":
 		models = registry.GetOpenAIModels()
+		if entry := s.resolveConfigCodexKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildCodexConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
 	case "qwen":
 		models = registry.GetQwenModels()
+		models = applyExcludedModels(models, excluded)
 	case "iflow":
 		models = registry.GetIFlowModels()
+		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {
@@ -686,7 +824,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 							Created:     time.Now().Unix(),
 							OwnedBy:     compat.Name,
 							Type:        "openai-compatibility",
-							DisplayName: m.Name,
+							DisplayName: modelID,
 						})
 					}
 					// Register and return
@@ -694,7 +832,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						if providerKey == "" {
 							providerKey = "openai-compatibility"
 						}
-						GlobalModelRegistry().RegisterClient(a.ID, providerKey, ms)
+						GlobalModelRegistry().RegisterClient(a.ID, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
 					} else {
 						// Ensure stale registrations are cleared when model list becomes empty.
 						GlobalModelRegistry().UnregisterClient(a.ID)
@@ -709,13 +847,17 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 	}
+	models = applyOAuthModelMappings(s.cfg, provider, authKind, models)
 	if len(models) > 0 {
 		key := provider
 		if key == "" {
 			key = strings.ToLower(strings.TrimSpace(a.Provider))
 		}
-		GlobalModelRegistry().RegisterClient(a.ID, key, models)
+		GlobalModelRegistry().RegisterClient(a.ID, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
+		return
 	}
+
+	GlobalModelRegistry().UnregisterClient(a.ID)
 }
 
 func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey {
@@ -738,7 +880,7 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 			continue
 		}
 		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
-			if attrBase == "" || cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
+			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
 				return entry
 			}
 		}
@@ -757,17 +899,242 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 	return nil
 }
 
-func buildClaudeConfigModels(entry *config.ClaudeKey) []*ModelInfo {
-	if entry == nil || len(entry.Models) == 0 {
+func (s *Service) resolveConfigGeminiKey(auth *coreauth.Auth) *config.GeminiKey {
+	if auth == nil || s.cfg == nil {
+		return nil
+	}
+	var attrKey, attrBase string
+	if auth.Attributes != nil {
+		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
+		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	for i := range s.cfg.GeminiKey {
+		entry := &s.cfg.GeminiKey[i]
+		cfgKey := strings.TrimSpace(entry.APIKey)
+		cfgBase := strings.TrimSpace(entry.BaseURL)
+		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
+			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
+				return entry
+			}
+			continue
+		}
+		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
+			return entry
+		}
+	}
+	return nil
+}
+
+func (s *Service) resolveConfigVertexCompatKey(auth *coreauth.Auth) *config.VertexCompatKey {
+	if auth == nil || s.cfg == nil {
+		return nil
+	}
+	var attrKey, attrBase string
+	if auth.Attributes != nil {
+		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
+		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	for i := range s.cfg.VertexCompatAPIKey {
+		entry := &s.cfg.VertexCompatAPIKey[i]
+		cfgKey := strings.TrimSpace(entry.APIKey)
+		cfgBase := strings.TrimSpace(entry.BaseURL)
+		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
+			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
+				return entry
+			}
+			continue
+		}
+		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
+			return entry
+		}
+	}
+	if attrKey != "" {
+		for i := range s.cfg.VertexCompatAPIKey {
+			entry := &s.cfg.VertexCompatAPIKey[i]
+			if strings.EqualFold(strings.TrimSpace(entry.APIKey), attrKey) {
+				return entry
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
+	if auth == nil || s.cfg == nil {
+		return nil
+	}
+	var attrKey, attrBase string
+	if auth.Attributes != nil {
+		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
+		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	for i := range s.cfg.CodexKey {
+		entry := &s.cfg.CodexKey[i]
+		cfgKey := strings.TrimSpace(entry.APIKey)
+		cfgBase := strings.TrimSpace(entry.BaseURL)
+		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
+			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
+				return entry
+			}
+			continue
+		}
+		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
+			return entry
+		}
+	}
+	return nil
+}
+
+func (s *Service) oauthExcludedModels(provider, authKind string) []string {
+	cfg := s.cfg
+	if cfg == nil {
+		return nil
+	}
+	authKindKey := strings.ToLower(strings.TrimSpace(authKind))
+	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	if authKindKey == "apikey" {
+		return nil
+	}
+	return cfg.OAuthExcludedModels[providerKey]
+}
+
+func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
+	if len(models) == 0 || len(excluded) == 0 {
+		return models
+	}
+
+	patterns := make([]string, 0, len(excluded))
+	for _, item := range excluded {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			patterns = append(patterns, strings.ToLower(trimmed))
+		}
+	}
+	if len(patterns) == 0 {
+		return models
+	}
+
+	filtered := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		modelID := strings.ToLower(strings.TrimSpace(model.ID))
+		blocked := false
+		for _, pattern := range patterns {
+			if matchWildcard(pattern, modelID) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
+
+func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {
+	trimmedPrefix := strings.TrimSpace(prefix)
+	if trimmedPrefix == "" || len(models) == 0 {
+		return models
+	}
+
+	out := make([]*ModelInfo, 0, len(models)*2)
+	seen := make(map[string]struct{}, len(models)*2)
+
+	addModel := func(model *ModelInfo) {
+		if model == nil {
+			return
+		}
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, model)
+	}
+
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		baseID := strings.TrimSpace(model.ID)
+		if baseID == "" {
+			continue
+		}
+		if !forceModelPrefix || trimmedPrefix == baseID {
+			addModel(model)
+		}
+		clone := *model
+		clone.ID = trimmedPrefix + "/" + baseID
+		addModel(&clone)
+	}
+	return out
+}
+
+// matchWildcard performs case-insensitive wildcard matching where '*' matches any substring.
+func matchWildcard(pattern, value string) bool {
+	if pattern == "" {
+		return false
+	}
+
+	// Fast path for exact match (no wildcard present).
+	if !strings.Contains(pattern, "*") {
+		return pattern == value
+	}
+
+	parts := strings.Split(pattern, "*")
+	// Handle prefix.
+	if prefix := parts[0]; prefix != "" {
+		if !strings.HasPrefix(value, prefix) {
+			return false
+		}
+		value = value[len(prefix):]
+	}
+
+	// Handle suffix.
+	if suffix := parts[len(parts)-1]; suffix != "" {
+		if !strings.HasSuffix(value, suffix) {
+			return false
+		}
+		value = value[:len(value)-len(suffix)]
+	}
+
+	// Handle middle segments in order.
+	for i := 1; i < len(parts)-1; i++ {
+		segment := parts[i]
+		if segment == "" {
+			continue
+		}
+		idx := strings.Index(value, segment)
+		if idx < 0 {
+			return false
+		}
+		value = value[idx+len(segment):]
+	}
+
+	return true
+}
+
+type modelEntry interface {
+	GetName() string
+	GetAlias() string
+}
+
+func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {
+	if len(models) == 0 {
 		return nil
 	}
 	now := time.Now().Unix()
-	out := make([]*ModelInfo, 0, len(entry.Models))
-	seen := make(map[string]struct{}, len(entry.Models))
-	for i := range entry.Models {
-		model := entry.Models[i]
-		name := strings.TrimSpace(model.Name)
-		alias := strings.TrimSpace(model.Alias)
+	out := make([]*ModelInfo, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for i := range models {
+		model := models[i]
+		name := strings.TrimSpace(model.GetName())
+		alias := strings.TrimSpace(model.GetAlias())
 		if alias == "" {
 			alias = name
 		}
@@ -783,14 +1150,135 @@ func buildClaudeConfigModels(entry *config.ClaudeKey) []*ModelInfo {
 		if display == "" {
 			display = alias
 		}
-		out = append(out, &ModelInfo{
+		info := &ModelInfo{
 			ID:          alias,
 			Object:      "model",
 			Created:     now,
-			OwnedBy:     "claude",
-			Type:        "claude",
+			OwnedBy:     ownedBy,
+			Type:        modelType,
 			DisplayName: display,
-		})
+		}
+		if name != "" {
+			if upstream := registry.LookupStaticModelInfo(name); upstream != nil && upstream.Thinking != nil {
+				info.Thinking = upstream.Thinking
+			}
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+func buildVertexCompatConfigModels(entry *config.VertexCompatKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "google", "vertex")
+}
+
+func buildGeminiConfigModels(entry *config.GeminiKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "google", "gemini")
+}
+
+func buildClaudeConfigModels(entry *config.ClaudeKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "anthropic", "claude")
+}
+
+func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "openai", "openai")
+}
+
+func rewriteModelInfoName(name, oldID, newID string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return name
+	}
+	oldID = strings.TrimSpace(oldID)
+	newID = strings.TrimSpace(newID)
+	if oldID == "" || newID == "" {
+		return name
+	}
+	if strings.EqualFold(oldID, newID) {
+		return name
+	}
+	if strings.HasSuffix(trimmed, "/"+oldID) {
+		prefix := strings.TrimSuffix(trimmed, oldID)
+		return prefix + newID
+	}
+	if trimmed == "models/"+oldID {
+		return "models/" + newID
+	}
+	return name
+}
+
+func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, models []*ModelInfo) []*ModelInfo {
+	if cfg == nil || len(models) == 0 {
+		return models
+	}
+	channel := coreauth.OAuthModelMappingChannel(provider, authKind)
+	if channel == "" || len(cfg.OAuthModelMappings) == 0 {
+		return models
+	}
+	mappings := cfg.OAuthModelMappings[channel]
+	if len(mappings) == 0 {
+		return models
+	}
+	forward := make(map[string]string, len(mappings))
+	for i := range mappings {
+		name := strings.TrimSpace(mappings[i].Name)
+		alias := strings.TrimSpace(mappings[i].Alias)
+		if name == "" || alias == "" {
+			continue
+		}
+		if strings.EqualFold(name, alias) {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, exists := forward[key]; exists {
+			continue
+		}
+		forward[key] = alias
+	}
+	if len(forward) == 0 {
+		return models
+	}
+	out := make([]*ModelInfo, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			continue
+		}
+		mappedID := id
+		if to, ok := forward[strings.ToLower(id)]; ok && strings.TrimSpace(to) != "" {
+			mappedID = strings.TrimSpace(to)
+		}
+		uniqueKey := strings.ToLower(mappedID)
+		if _, exists := seen[uniqueKey]; exists {
+			continue
+		}
+		seen[uniqueKey] = struct{}{}
+		if mappedID == id {
+			out = append(out, model)
+			continue
+		}
+		clone := *model
+		clone.ID = mappedID
+		if clone.Name != "" {
+			clone.Name = rewriteModelInfoName(clone.Name, id, mappedID)
+		}
+		out = append(out, &clone)
 	}
 	return out
 }
