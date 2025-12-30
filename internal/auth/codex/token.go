@@ -4,7 +4,10 @@
 package codex
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/accounts"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -42,24 +45,46 @@ type CodexTokenStorage struct {
 // Returns:
 //   - error: An error if the operation fails, nil otherwise
 func (ts *CodexTokenStorage) SaveTokenToFile(authFilePath string) error {
-	if ts.AccountID == "" {
-		return fmt.Errorf("account_id is required for multi-account storage")
-	}
 	misc.LogSavingCredentials(authFilePath)
-	return accounts.SaveProviderAccount("codex", ts.AccountID, func(existing map[string]any) map[string]any {
-		for k, v := range map[string]any{
-			"id_token":      ts.IDToken,
-			"access_token":  ts.AccessToken,
-			"refresh_token": ts.RefreshToken,
-			"last_refresh":  ts.LastRefresh,
-			"email":         ts.Email,
-			"expired":       ts.Expire,
-		} {
-			if s, ok := v.(string); ok && s == "" {
-				continue
+	ts.Type = "codex"
+
+	// If we have a stable account id, prefer multi-account storage in ~/.cli-proxy-api.
+	if ts.AccountID != "" {
+		return accounts.SaveProviderAccount("codex", ts.AccountID, func(existing map[string]any) map[string]any {
+			for k, v := range map[string]any{
+				"id_token":      ts.IDToken,
+				"access_token":  ts.AccessToken,
+				"refresh_token": ts.RefreshToken,
+				"last_refresh":  ts.LastRefresh,
+				"email":         ts.Email,
+				"expired":       ts.Expire,
+				"type":          ts.Type,
+			} {
+				if s, ok := v.(string); ok && s == "" {
+					continue
+				}
+				existing[k] = v
 			}
-			existing[k] = v
-		}
-		return existing
-	})
+			return existing
+		})
+	}
+
+	// Fallback: legacy single-account path.
+	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
+	}
+
+	f, err := os.Create(authFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create token file: %w", err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	if err = json.NewEncoder(f).Encode(ts); err != nil {
+		return fmt.Errorf("failed to write token to file: %w", err)
+	}
+	return nil
+
 }

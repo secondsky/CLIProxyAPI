@@ -4,7 +4,10 @@
 package claude
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/accounts"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -26,6 +29,9 @@ type ClaudeTokenStorage struct {
 	// LastRefresh is the timestamp of the last token refresh operation.
 	LastRefresh string `json:"last_refresh"`
 
+	// AccountID is the Anthropic account identifier associated with this token.
+	AccountID string `json:"account_id"`
+
 	// Email is the Anthropic account email address associated with this token.
 	Email string `json:"email"`
 
@@ -46,24 +52,47 @@ type ClaudeTokenStorage struct {
 // Returns:
 //   - error: An error if the operation fails, nil otherwise
 func (ts *ClaudeTokenStorage) SaveTokenToFile(authFilePath string) error {
-	if ts.Email == "" {
-		return fmt.Errorf("email is required for Claude account identification")
-	}
 	misc.LogSavingCredentials(authFilePath)
-	accountID := ts.Email
-	return accounts.SaveProviderAccount("claude", accountID, func(existing map[string]any) map[string]any {
-		for k, v := range map[string]any{
-			"access_token":  ts.AccessToken,
-			"refresh_token": ts.RefreshToken,
-			"last_refresh":  ts.LastRefresh,
-			"email":         ts.Email,
-			"expired":       ts.Expire,
-		} {
-			if s, ok := v.(string); ok && s == "" {
-				continue
+	ts.Type = "claude"
+
+	// Multi-account storage when we know the account id.
+	if ts.AccountID != "" {
+		return accounts.SaveProviderAccount("claude", ts.AccountID, func(existing map[string]any) map[string]any {
+			for k, v := range map[string]any{
+				"id_token":      ts.IDToken,
+				"access_token":  ts.AccessToken,
+				"refresh_token": ts.RefreshToken,
+				"last_refresh":  ts.LastRefresh,
+				"email":         ts.Email,
+				"expired":       ts.Expire,
+				"type":          ts.Type,
+			} {
+				if s, ok := v.(string); ok && s == "" {
+					continue
+				}
+				existing[k] = v
 			}
-			existing[k] = v
-		}
-		return existing
-	})
+			return existing
+		})
+	}
+
+	// Create directory structure if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
+	}
+
+	// Create the token file
+	f, err := os.Create(authFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create token file: %w", err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	// Encode and write the token data as JSON
+	if err = json.NewEncoder(f).Encode(ts); err != nil {
+		return fmt.Errorf("failed to write token to file: %w", err)
+	}
+	return nil
 }

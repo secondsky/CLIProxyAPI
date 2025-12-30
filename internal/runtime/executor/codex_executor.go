@@ -49,14 +49,21 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
 	defer reporter.trackFailure(ctx, &err)
 
+	model := req.Model
+	if override := e.resolveUpstreamModel(req.Model, auth); override != "" {
+		model = override
+	}
+
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
-
-	body = e.setReasoningEffortByAlias(req.Model, body)
-
-	body = applyPayloadConfig(e.cfg, req.Model, body)
-
+	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), false)
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, model, "reasoning.effort", false)
+	body = NormalizeThinkingConfig(body, model, false)
+	if errValidate := ValidateThinkingConfig(body, model); errValidate != nil {
+		return resp, errValidate
+	}
+	body = applyPayloadConfig(e.cfg, model, body)
+	body, _ = sjson.SetBytes(body, "model", model)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 
@@ -142,13 +149,23 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
 	defer reporter.trackFailure(ctx, &err)
 
+	model := req.Model
+	if override := e.resolveUpstreamModel(req.Model, auth); override != "" {
+		model = override
+	}
+
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), true)
 
-	body = e.setReasoningEffortByAlias(req.Model, body)
-	body = applyPayloadConfig(e.cfg, req.Model, body)
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, model, "reasoning.effort", false)
+	body = NormalizeThinkingConfig(body, model, false)
+	if errValidate := ValidateThinkingConfig(body, model); errValidate != nil {
+		return nil, errValidate
+	}
+	body = applyPayloadConfig(e.cfg, model, body)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
+	body, _ = sjson.SetBytes(body, "model", model)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -205,7 +222,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, 20_971_520)
+		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -235,18 +252,21 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	model := req.Model
+	if override := e.resolveUpstreamModel(req.Model, auth); override != "" {
+		model = override
+	}
+
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
+	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), false)
 
-	modelForCounting := req.Model
-
-	body = e.setReasoningEffortByAlias(req.Model, body)
-
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, model, "reasoning.effort", false)
+	body, _ = sjson.SetBytes(body, "model", model)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.SetBytes(body, "stream", false)
 
-	enc, err := tokenizerForCodexModel(modelForCounting)
+	enc, err := tokenizerForCodexModel(model)
 	if err != nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex executor: tokenizer init failed: %w", err)
 	}
@@ -259,83 +279,6 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	usageJSON := fmt.Sprintf(`{"response":{"usage":{"input_tokens":%d,"output_tokens":0,"total_tokens":%d}}}`, count, count)
 	translated := sdktranslator.TranslateTokenCount(ctx, to, from, count, []byte(usageJSON))
 	return cliproxyexecutor.Response{Payload: []byte(translated)}, nil
-}
-
-func (e *CodexExecutor) setReasoningEffortByAlias(modelName string, payload []byte) []byte {
-	if util.InArray([]string{"gpt-5", "gpt-5-minimal", "gpt-5-low", "gpt-5-medium", "gpt-5-high"}, modelName) {
-		payload, _ = sjson.SetBytes(payload, "model", "gpt-5")
-		switch modelName {
-		case "gpt-5-minimal":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "minimal")
-		case "gpt-5-low":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "low")
-		case "gpt-5-medium":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "medium")
-		case "gpt-5-high":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "high")
-		}
-	} else if util.InArray([]string{"gpt-5-codex", "gpt-5-codex-low", "gpt-5-codex-medium", "gpt-5-codex-high"}, modelName) {
-		payload, _ = sjson.SetBytes(payload, "model", "gpt-5-codex")
-		switch modelName {
-		case "gpt-5-codex-low":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "low")
-		case "gpt-5-codex-medium":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "medium")
-		case "gpt-5-codex-high":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "high")
-		}
-	} else if util.InArray([]string{"gpt-5-codex-mini", "gpt-5-codex-mini-medium", "gpt-5-codex-mini-high"}, modelName) {
-		payload, _ = sjson.SetBytes(payload, "model", "gpt-5-codex-mini")
-		switch modelName {
-		case "gpt-5-codex-mini-medium":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "medium")
-		case "gpt-5-codex-mini-high":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "high")
-		}
-	} else if util.InArray([]string{"gpt-5.1", "gpt-5.1-none", "gpt-5.1-low", "gpt-5.1-medium", "gpt-5.1-high"}, modelName) {
-		payload, _ = sjson.SetBytes(payload, "model", "gpt-5.1")
-		switch modelName {
-		case "gpt-5.1-none":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "none")
-		case "gpt-5.1-low":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "low")
-		case "gpt-5.1-medium":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "medium")
-		case "gpt-5.1-high":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "high")
-		}
-	} else if util.InArray([]string{"gpt-5.1-codex", "gpt-5.1-codex-low", "gpt-5.1-codex-medium", "gpt-5.1-codex-high"}, modelName) {
-		payload, _ = sjson.SetBytes(payload, "model", "gpt-5.1-codex")
-		switch modelName {
-		case "gpt-5.1-codex-low":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "low")
-		case "gpt-5.1-codex-medium":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "medium")
-		case "gpt-5.1-codex-high":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "high")
-		}
-	} else if util.InArray([]string{"gpt-5.1-codex-mini", "gpt-5.1-codex-mini-medium", "gpt-5.1-codex-mini-high"}, modelName) {
-		payload, _ = sjson.SetBytes(payload, "model", "gpt-5.1-codex-mini")
-		switch modelName {
-		case "gpt-5.1-codex-mini-medium":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "medium")
-		case "gpt-5.1-codex-mini-high":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "high")
-		}
-	} else if util.InArray([]string{"gpt-5.1-codex-max", "gpt-5.1-codex-max-low", "gpt-5.1-codex-max-medium", "gpt-5.1-codex-max-high", "gpt-5.1-codex-max-xhigh"}, modelName) {
-		payload, _ = sjson.SetBytes(payload, "model", "gpt-5.1-codex-max")
-		switch modelName {
-		case "gpt-5.1-codex-max-low":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "low")
-		case "gpt-5.1-codex-max-medium":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "medium")
-		case "gpt-5.1-codex-max-high":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "high")
-		case "gpt-5.1-codex-max-xhigh":
-			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "xhigh")
-		}
-	}
-	return payload
 }
 
 func tokenizerForCodexModel(model string) (tokenizer.Codec, error) {
@@ -583,4 +526,88 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		}
 	}
 	return
+}
+
+func (e *CodexExecutor) resolveUpstreamModel(alias string, auth *cliproxyauth.Auth) string {
+	trimmed := strings.TrimSpace(alias)
+	if trimmed == "" {
+		return ""
+	}
+
+	entry := e.resolveCodexConfig(auth)
+	if entry == nil {
+		return ""
+	}
+
+	normalizedModel, metadata := util.NormalizeThinkingModel(trimmed)
+
+	// Candidate names to match against configured aliases/names.
+	candidates := []string{strings.TrimSpace(normalizedModel)}
+	if !strings.EqualFold(normalizedModel, trimmed) {
+		candidates = append(candidates, trimmed)
+	}
+	if original := util.ResolveOriginalModel(normalizedModel, metadata); original != "" && !strings.EqualFold(original, normalizedModel) {
+		candidates = append(candidates, original)
+	}
+
+	for i := range entry.Models {
+		model := entry.Models[i]
+		name := strings.TrimSpace(model.Name)
+		modelAlias := strings.TrimSpace(model.Alias)
+
+		for _, candidate := range candidates {
+			if candidate == "" {
+				continue
+			}
+			if modelAlias != "" && strings.EqualFold(modelAlias, candidate) {
+				if name != "" {
+					return name
+				}
+				return candidate
+			}
+			if name != "" && strings.EqualFold(name, candidate) {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.CodexKey {
+	if auth == nil || e.cfg == nil {
+		return nil
+	}
+	var attrKey, attrBase string
+	if auth.Attributes != nil {
+		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
+		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	for i := range e.cfg.CodexKey {
+		entry := &e.cfg.CodexKey[i]
+		cfgKey := strings.TrimSpace(entry.APIKey)
+		cfgBase := strings.TrimSpace(entry.BaseURL)
+		if attrKey != "" && attrBase != "" {
+			if strings.EqualFold(cfgKey, attrKey) && strings.EqualFold(cfgBase, attrBase) {
+				return entry
+			}
+			continue
+		}
+		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
+			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
+				return entry
+			}
+		}
+		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
+			return entry
+		}
+	}
+	if attrKey != "" {
+		for i := range e.cfg.CodexKey {
+			entry := &e.cfg.CodexKey[i]
+			if strings.EqualFold(strings.TrimSpace(entry.APIKey), attrKey) {
+				return entry
+			}
+		}
+	}
+	return nil
 }

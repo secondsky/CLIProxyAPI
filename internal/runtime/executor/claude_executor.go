@@ -49,26 +49,29 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
 	defer reporter.trackFailure(ctx, &err)
+	model := req.Model
+	if override := e.resolveUpstreamModel(req.Model, auth); override != "" {
+		model = override
+	}
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), stream)
-	modelForUpstream := req.Model
-	if modelOverride := e.resolveUpstreamModel(req.Model, auth); modelOverride != "" {
-		body, _ = sjson.SetBytes(body, "model", modelOverride)
-		modelForUpstream = modelOverride
-	}
-	// Inject thinking config based on model suffix for thinking variants
-	body = e.injectThinkingConfig(req.Model, body)
+	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), stream)
+	body, _ = sjson.SetBytes(body, "model", model)
+	// Inject thinking config based on model metadata for thinking variants
+	body = e.injectThinkingConfig(model, req.Metadata, body)
 
-	if !strings.HasPrefix(modelForUpstream, "claude-3-5-haiku") {
+	if !strings.HasPrefix(model, "claude-3-5-haiku") {
 		body = checkSystemInstructions(body)
 	}
-	body = applyPayloadConfig(e.cfg, req.Model, body)
+	body = applyPayloadConfig(e.cfg, model, body)
+
+	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
+	body = disableThinkingIfToolChoiceForced(body)
 
 	// Ensure max_tokens > thinking.budget_tokens when thinking is enabled
-	body = ensureMaxTokensForThinking(req.Model, body)
+	body = ensureMaxTokensForThinking(model, body)
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
@@ -160,17 +163,22 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	defer reporter.trackFailure(ctx, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
-	if modelOverride := e.resolveUpstreamModel(req.Model, auth); modelOverride != "" {
-		body, _ = sjson.SetBytes(body, "model", modelOverride)
+	model := req.Model
+	if override := e.resolveUpstreamModel(req.Model, auth); override != "" {
+		model = override
 	}
-	// Inject thinking config based on model suffix for thinking variants
-	body = e.injectThinkingConfig(req.Model, body)
+	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), true)
+	body, _ = sjson.SetBytes(body, "model", model)
+	// Inject thinking config based on model metadata for thinking variants
+	body = e.injectThinkingConfig(model, req.Metadata, body)
 	body = checkSystemInstructions(body)
-	body = applyPayloadConfig(e.cfg, req.Model, body)
+	body = applyPayloadConfig(e.cfg, model, body)
+
+	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
+	body = disableThinkingIfToolChoiceForced(body)
 
 	// Ensure max_tokens > thinking.budget_tokens when thinking is enabled
-	body = ensureMaxTokensForThinking(req.Model, body)
+	body = ensureMaxTokensForThinking(model, body)
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
@@ -238,7 +246,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// If from == to (Claude → Claude), directly forward the SSE stream without translation
 		if from == to {
 			scanner := bufio.NewScanner(decodedBody)
-			scanner.Buffer(nil, 20_971_520)
+			scanner.Buffer(nil, 52_428_800) // 50MB
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				appendAPIResponseChunk(ctx, e.cfg, line)
@@ -261,7 +269,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 		// For other formats, use translation
 		scanner := bufio.NewScanner(decodedBody)
-		scanner.Buffer(nil, 20_971_520)
+		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -294,14 +302,14 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	to := sdktranslator.FromString("claude")
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), stream)
-	modelForUpstream := req.Model
-	if modelOverride := e.resolveUpstreamModel(req.Model, auth); modelOverride != "" {
-		body, _ = sjson.SetBytes(body, "model", modelOverride)
-		modelForUpstream = modelOverride
+	model := req.Model
+	if override := e.resolveUpstreamModel(req.Model, auth); override != "" {
+		model = override
 	}
+	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), stream)
+	body, _ = sjson.SetBytes(body, "model", model)
 
-	if !strings.HasPrefix(modelForUpstream, "claude-3-5-haiku") {
+	if !strings.HasPrefix(model, "claude-3-5-haiku") {
 		body = checkSystemInstructions(body)
 	}
 
@@ -427,30 +435,27 @@ func extractAndRemoveBetas(body []byte) ([]string, []byte) {
 	return betas, body
 }
 
-// injectThinkingConfig adds thinking configuration based on model name suffix
-func (e *ClaudeExecutor) injectThinkingConfig(modelName string, body []byte) []byte {
-	// Only inject if thinking config is not already present
-	if gjson.GetBytes(body, "thinking").Exists() {
+// injectThinkingConfig adds thinking configuration based on metadata using the unified flow.
+// It uses util.ResolveClaudeThinkingConfig which internally calls ResolveThinkingConfigFromMetadata
+// and NormalizeThinkingBudget, ensuring consistency with other executors like Gemini.
+func (e *ClaudeExecutor) injectThinkingConfig(modelName string, metadata map[string]any, body []byte) []byte {
+	budget, ok := util.ResolveClaudeThinkingConfig(modelName, metadata)
+	if !ok {
 		return body
 	}
+	return util.ApplyClaudeThinkingConfig(body, budget)
+}
 
-	var budgetTokens int
-	switch {
-	case strings.HasSuffix(modelName, "-thinking-low"):
-		budgetTokens = 1024
-	case strings.HasSuffix(modelName, "-thinking-medium"):
-		budgetTokens = 8192
-	case strings.HasSuffix(modelName, "-thinking-high"):
-		budgetTokens = 24576
-	case strings.HasSuffix(modelName, "-thinking"):
-		// Default thinking without suffix uses medium budget
-		budgetTokens = 8192
-	default:
-		return body
+// disableThinkingIfToolChoiceForced checks if tool_choice forces tool use and disables thinking.
+// Anthropic API does not allow thinking when tool_choice is set to "any" or a specific tool.
+// See: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#important-considerations
+func disableThinkingIfToolChoiceForced(body []byte) []byte {
+	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
+	// "auto" is allowed with thinking, but "any" or "tool" (specific tool) are not
+	if toolChoiceType == "any" || toolChoiceType == "tool" {
+		// Remove thinking configuration entirely to avoid API error
+		body, _ = sjson.DeleteBytes(body, "thinking")
 	}
-
-	body, _ = sjson.SetBytes(body, "thinking.type", "enabled")
-	body, _ = sjson.SetBytes(body, "thinking.budget_tokens", budgetTokens)
 	return body
 }
 
@@ -491,35 +496,45 @@ func ensureMaxTokensForThinking(modelName string, body []byte) []byte {
 }
 
 func (e *ClaudeExecutor) resolveUpstreamModel(alias string, auth *cliproxyauth.Auth) string {
-	if alias == "" {
+	trimmed := strings.TrimSpace(alias)
+	if trimmed == "" {
 		return ""
 	}
-	// Hardcoded mappings for thinking models to actual Claude model names
-	switch alias {
-	case "claude-opus-4-5-thinking", "claude-opus-4-5-thinking-low", "claude-opus-4-5-thinking-medium", "claude-opus-4-5-thinking-high":
-		return "claude-opus-4-5-20251101"
-	case "claude-sonnet-4-5-thinking":
-		return "claude-sonnet-4-5-20250929"
-	}
+
 	entry := e.resolveClaudeConfig(auth)
 	if entry == nil {
 		return ""
 	}
+
+	normalizedModel, metadata := util.NormalizeThinkingModel(trimmed)
+
+	// Candidate names to match against configured aliases/names.
+	candidates := []string{strings.TrimSpace(normalizedModel)}
+	if !strings.EqualFold(normalizedModel, trimmed) {
+		candidates = append(candidates, trimmed)
+	}
+	if original := util.ResolveOriginalModel(normalizedModel, metadata); original != "" && !strings.EqualFold(original, normalizedModel) {
+		candidates = append(candidates, original)
+	}
+
 	for i := range entry.Models {
 		model := entry.Models[i]
 		name := strings.TrimSpace(model.Name)
 		modelAlias := strings.TrimSpace(model.Alias)
-		if modelAlias != "" {
-			if strings.EqualFold(modelAlias, alias) {
+
+		for _, candidate := range candidates {
+			if candidate == "" {
+				continue
+			}
+			if modelAlias != "" && strings.EqualFold(modelAlias, candidate) {
 				if name != "" {
 					return name
 				}
-				return alias
+				return candidate
 			}
-			continue
-		}
-		if name != "" && strings.EqualFold(name, alias) {
-			return name
+			if name != "" && strings.EqualFold(name, candidate) {
+				return name
+			}
 		}
 	}
 	return ""
@@ -645,7 +660,14 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 }
 
 func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string) {
-	r.Header.Set("Authorization", "Bearer "+apiKey)
+	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
+	isAnthropicBase := r.URL != nil && strings.EqualFold(r.URL.Scheme, "https") && strings.EqualFold(r.URL.Host, "api.anthropic.com")
+	if isAnthropicBase && useAPIKey {
+		r.Header.Del("Authorization")
+		r.Header.Set("x-api-key", apiKey)
+	} else {
+		r.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 	r.Header.Set("Content-Type", "application/json")
 
 	var ginHeaders http.Header

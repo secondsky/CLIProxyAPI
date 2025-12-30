@@ -4,11 +4,15 @@
 package gemini
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/accounts"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	log "github.com/sirupsen/logrus"
 )
 
 // GeminiTokenStorage stores OAuth2 token information for Google Gemini API authentication.
@@ -20,6 +24,9 @@ type GeminiTokenStorage struct {
 
 	// ProjectID is the Google Cloud Project ID associated with this token.
 	ProjectID string `json:"project_id"`
+
+	// AccountID is a stable identifier for this credential (email or email+project).
+	AccountID string `json:"account_id"`
 
 	// Email is the email address of the authenticated user.
 	Email string `json:"email"`
@@ -47,40 +54,49 @@ func (ts *GeminiTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "gemini"
 
-	if ts.Email == "" {
-		return fmt.Errorf("email is required for Gemini account identification")
-	}
-
-	// Distinguish accounts by project when provided (supports multi-project installs).
-	accountID := strings.TrimSpace(ts.Email)
-	if proj := strings.TrimSpace(ts.ProjectID); proj != "" {
-		norm := proj
-		if strings.EqualFold(norm, "all") || strings.Contains(norm, ",") {
-			norm = "all"
+	// Derive account id if missing.
+	if strings.TrimSpace(ts.AccountID) == "" {
+		id := strings.TrimSpace(ts.Email)
+		if p := strings.TrimSpace(ts.ProjectID); p != "" {
+			id = fmt.Sprintf("%s-%s", id, p)
 		}
-		accountID = fmt.Sprintf("%s-%s", accountID, norm)
+		ts.AccountID = id
 	}
 
-	return accounts.SaveProviderAccount("gemini", accountID, func(existing map[string]any) map[string]any {
-		for k, v := range map[string]any{
-			"token":      ts.Token,
-			"project_id": ts.ProjectID,
-			"email":      ts.Email,
-			"auto":       ts.Auto,
-			"checked":    ts.Checked,
-		} {
-			switch val := v.(type) {
-			case string:
-				if val == "" {
-					continue
-				}
-			case nil:
-				continue
+	if ts.AccountID != "" {
+		return accounts.SaveProviderAccount("gemini", ts.AccountID, func(existing map[string]any) map[string]any {
+			for k, v := range map[string]any{
+				"token":      ts.Token,
+				"project_id": ts.ProjectID,
+				"email":      ts.Email,
+				"auto":       ts.Auto,
+				"checked":    ts.Checked,
+				"type":       ts.Type,
+			} {
+				existing[k] = v
 			}
-			existing[k] = v
+			return existing
+		})
+	}
+
+	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
+	}
+
+	f, err := os.Create(authFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create token file: %w", err)
+	}
+	defer func() {
+		if errClose := f.Close(); errClose != nil {
+			log.Errorf("failed to close file: %v", errClose)
 		}
-		return existing
-	})
+	}()
+
+	if err = json.NewEncoder(f).Encode(ts); err != nil {
+		return fmt.Errorf("failed to write token to file: %w", err)
+	}
+	return nil
 }
 
 // CredentialFileName returns the filename used to persist Gemini CLI credentials.

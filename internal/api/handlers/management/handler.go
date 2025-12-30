@@ -59,6 +59,11 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	}
 }
 
+// NewHandler creates a new management handler instance.
+func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manager) *Handler {
+	return NewHandler(cfg, "", manager)
+}
+
 // SetConfig updates the in-memory config reference when the server hot-reloads.
 func (h *Handler) SetConfig(cfg *config.Config) { h.cfg = cfg }
 
@@ -240,16 +245,6 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 		Value *bool `json:"value"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
-		var m map[string]any
-		if err2 := c.ShouldBindJSON(&m); err2 == nil {
-			for _, v := range m {
-				if b, ok := v.(bool); ok {
-					set(b)
-					h.persist(c)
-					return
-				}
-			}
-		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}

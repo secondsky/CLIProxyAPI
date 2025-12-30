@@ -8,9 +8,12 @@ package chat_completions
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/openai/chat-completions"
 	"github.com/tidwall/gjson"
@@ -22,6 +25,9 @@ type convertCliResponseToOpenAIChatParams struct {
 	UnixTimestamp int64
 	FunctionIndex int
 }
+
+// functionCallIDCounter provides a process-wide unique counter for function call identifiers.
+var functionCallIDCounter uint64
 
 // ConvertAntigravityResponseToOpenAI translates a single chunk of a streaming response from the
 // Gemini CLI API format to the OpenAI Chat Completions streaming format.
@@ -75,23 +81,32 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 
 	// Extract and set the finish reason.
 	if finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason"); finishReasonResult.Exists() {
-		template, _ = sjson.Set(template, "choices.0.finish_reason", finishReasonResult.String())
-		template, _ = sjson.Set(template, "choices.0.native_finish_reason", finishReasonResult.String())
+		template, _ = sjson.Set(template, "choices.0.finish_reason", strings.ToLower(finishReasonResult.String()))
+		template, _ = sjson.Set(template, "choices.0.native_finish_reason", strings.ToLower(finishReasonResult.String()))
 	}
 
 	// Extract and set usage metadata (token counts).
 	if usageResult := gjson.GetBytes(rawJSON, "response.usageMetadata"); usageResult.Exists() {
+		cachedTokenCount := usageResult.Get("cachedContentTokenCount").Int()
 		if candidatesTokenCountResult := usageResult.Get("candidatesTokenCount"); candidatesTokenCountResult.Exists() {
 			template, _ = sjson.Set(template, "usage.completion_tokens", candidatesTokenCountResult.Int())
 		}
 		if totalTokenCountResult := usageResult.Get("totalTokenCount"); totalTokenCountResult.Exists() {
 			template, _ = sjson.Set(template, "usage.total_tokens", totalTokenCountResult.Int())
 		}
-		promptTokenCount := usageResult.Get("promptTokenCount").Int()
+		promptTokenCount := usageResult.Get("promptTokenCount").Int() - cachedTokenCount
 		thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
 		template, _ = sjson.Set(template, "usage.prompt_tokens", promptTokenCount+thoughtsTokenCount)
 		if thoughtsTokenCount > 0 {
 			template, _ = sjson.Set(template, "usage.completion_tokens_details.reasoning_tokens", thoughtsTokenCount)
+		}
+		// Include cached token count if present (indicates prompt caching is working)
+		if cachedTokenCount > 0 {
+			var err error
+			template, err = sjson.Set(template, "usage.prompt_tokens_details.cached_tokens", cachedTokenCount)
+			if err != nil {
+				log.Warnf("antigravity openai response: failed to set cached_tokens: %v", err)
+			}
 		}
 	}
 
@@ -145,7 +160,7 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 
 				functionCallTemplate := `{"id": "","index": 0,"type": "function","function": {"name": "","arguments": ""}}`
 				fcName := functionCallResult.Get("name").String()
-				functionCallTemplate, _ = sjson.Set(functionCallTemplate, "id", fmt.Sprintf("%s-%d", fcName, time.Now().UnixNano()))
+				functionCallTemplate, _ = sjson.Set(functionCallTemplate, "id", fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
 				functionCallTemplate, _ = sjson.Set(functionCallTemplate, "index", functionCallIndex)
 				functionCallTemplate, _ = sjson.Set(functionCallTemplate, "function.name", fcName)
 				if fcArgsResult := functionCallResult.Get("args"); fcArgsResult.Exists() {
@@ -166,21 +181,16 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 					mimeType = "image/png"
 				}
 				imageURL := fmt.Sprintf("data:%s;base64,%s", mimeType, data)
-				imagePayload, err := json.Marshal(map[string]any{
-					"type": "image_url",
-					"image_url": map[string]string{
-						"url": imageURL,
-					},
-				})
-				if err != nil {
-					continue
-				}
 				imagesResult := gjson.Get(template, "choices.0.delta.images")
 				if !imagesResult.Exists() || !imagesResult.IsArray() {
 					template, _ = sjson.SetRaw(template, "choices.0.delta.images", `[]`)
 				}
+				imageIndex := len(gjson.Get(template, "choices.0.delta.images").Array())
+				imagePayload := `{"type":"image_url","image_url":{"url":""}}`
+				imagePayload, _ = sjson.Set(imagePayload, "index", imageIndex)
+				imagePayload, _ = sjson.Set(imagePayload, "image_url.url", imageURL)
 				template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
-				template, _ = sjson.SetRaw(template, "choices.0.delta.images.-1", string(imagePayload))
+				template, _ = sjson.SetRaw(template, "choices.0.delta.images.-1", imagePayload)
 			}
 		}
 	}
